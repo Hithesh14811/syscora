@@ -1,0 +1,30 @@
+export function createCapabilityTemplate({ capabilityId = "example.capability", category = "example", owner = "Your Team" } = {}) {
+  return {
+    name: capabilityId,
+    version: "1.0.0",
+    category,
+    description: "Describe the capability and its safety boundary.",
+    owner,
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    outputSchema: { type: "object", properties: {} },
+    requirements: { permissions: [], elevation: "NONE", operatingSystems: ["win32"], software: [], capabilities: [], optionalCapabilities: [], alternativeCapabilities: [], conflicts: [], executionModes: ["runtime"] },
+    risk: { level: "LOW", policyRequirements: [] },
+    security: { filesystem: "NONE", registry: "NONE", network: "NONE", browser: "NONE", clipboard: "NONE", windowAutomation: "NONE", externalProcesses: "NONE" },
+    stateMutations: [],
+    preconditions: () => true,
+    execute: async () => ({}),
+    observe: async (result) => ({ structuredState: result, detectedChanges: [] }),
+    verify: async (observation) => ({ status: "VERIFIED", evidence: observation }),
+    rollbackSupport: "NOT_REQUIRED",
+    failureClassifications: [],
+    recoveryHints: [],
+    semanticUpdates: [],
+    memoryUpdates: [],
+    auditEvents: [],
+    performance: { timeoutMs: 15000, cancellation: true, resourceLimits: {}, temporaryWorkspace: true },
+    retryPolicy: { maxAttempts: 1, backoffMs: 0 },
+    health: { status: "HEALTHY", check: () => true },
+    documentation: { summary: "Explain inputs, outputs, safety, and recovery behavior.", examples: [] },
+    packaging: { runtimeVersion: ">=0.1.0", manifestVersion: "1", tests: ["test/capability.test.js"] }
+  };
+}

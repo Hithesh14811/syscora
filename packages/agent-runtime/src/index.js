@@ -12,7 +12,10 @@ import { GeneralPlanner, PlanValidator } from "../../planner/src/index.js";
 import { MockModelProvider } from "../../model-providers/src/index.js";
 import { TaskGraphScheduler } from "../../task-graph-scheduler/src/index.js";
 import { PerceptionEngine } from "../../perception/src/index.js";
+import { ReasoningEngine } from "../../reasoning-engine/src/index.js";
 import { GoalVerifier } from "./goal-verifier.js";
+import { RollbackManager } from "./rollback-manager.js";
+import { createRecoveryBudget } from "../../recovery-engine/src/index.js";
 
 export class AgentRuntime {
   constructor({
@@ -26,6 +29,8 @@ export class AgentRuntime {
     troubleshootingEngine,
     adapter,
     modelProvider,
+    reasoningEngine,
+    secretBroker,
     intentEngine,
     contextEngine,
     semanticState,
@@ -41,15 +46,25 @@ export class AgentRuntime {
     this.troubleshootingEngine = troubleshootingEngine;
     this.adapter = adapter;
     this.developerIntelligence = null;
-    this.modelProvider = modelProvider || new MockModelProvider();
-    this.intentEngine = intentEngine || new IntentEngine(this.modelProvider);
+    const provider = modelProvider || new MockModelProvider();
+    // The ReasoningEngine is the single boundary to any language model. The
+    // runtime and its sub-engines never call a provider directly; they ask the
+    // ReasoningEngine to reason and always keep their deterministic fallback.
+    this.reasoningEngine = reasoningEngine || new ReasoningEngine({
+      modelProvider: provider,
+      capabilityRegistry: this.capabilityRegistry
+    });
+    // The secret broker (DPAPI) supplies secrets to capability execution only.
+    // It is NEVER passed to the reasoning engine or included in prompts/audit.
+    this.secretBroker = secretBroker || null;
+    this.intentEngine = intentEngine || new IntentEngine(this.reasoningEngine);
     this.contextEngine = contextEngine || new ContextEngine([
       new SystemContextProvider(adapter),
       new ProcessContextProvider(adapter),
       new PortContextProvider(adapter),
       new EnvironmentContextProvider(adapter)
     ]);
-    this.generalPlanner = new GeneralPlanner(this.modelProvider, this.capabilityRegistry);
+    this.generalPlanner = new GeneralPlanner(this.reasoningEngine, this.capabilityRegistry);
     this.planValidator = new PlanValidator(this.capabilityRegistry);
     this.goalVerifier = new GoalVerifier();
     this.semanticState = semanticState;
@@ -74,12 +89,14 @@ export class AgentRuntime {
       troubleshootingEngine,
       adapter
     });
+    this.rollbackManager = new RollbackManager(capabilityRegistry);
   }
 
   setDeveloperIntelligence(engine) {
     this.developerIntelligence = engine;
     if (this.developerIntelligence) {
       const workspaceProvider = new WorkspaceContextProvider(this.adapter, this.developerIntelligence);
+      this.contextEngine.providers = this.contextEngine.providers.filter((provider) => provider.name !== "workspace");
       this.contextEngine.providers.push(workspaceProvider);
       // Rebuild perception providers so the DeveloperProvider has the engine.
       if (this.perception && this.semanticState) {
@@ -109,13 +126,12 @@ export class AgentRuntime {
       plan: null,
       riskAssessment: null,
       policyDecision: null,
-      checkpoint: null,
+      rollback: { records: [], completed: false, result: null },
       taskResults: [],
       observations: [],
       verifications: [],
       diagnoses: [],
-      recoveryAttempts: [],
-      recoveryBudget: { total: 3, used: 0 },
+      recoveryBudget: createRecoveryBudget(),
       finalResponse: null,
       events: []
     };
@@ -163,13 +179,24 @@ export class AgentRuntime {
         relevantMemory = await this.memory.retrieveRelevant(session.intent);
       }
 
-      session.context = {
-        ...baseContext,
-        semanticState: semanticContext,
-        memory: relevantMemory
-      };
+      const planningContext = this.contextEngine.buildPlanningContext({
+        intent: session.intent,
+        baseContext,
+        semanticSubgraph: session.semanticSubgraph,
+        memory: relevantMemory,
+        capabilityRegistry: this.capabilityRegistry,
+        policyConstraints: session.intent.constraints,
+        recoveryBudget: session.recoveryBudget
+      });
+      session.context = { baseContext, semanticState: semanticContext, memory: relevantMemory, planningContext };
 
-      await this.addSessionEvent(session, "CONTEXT_COLLECTED", { types: requiredContext, includesSemantic: !!this.semanticState, includesMemory: !!this.memory });
+      await this.addSessionEvent(session, "CONTEXT_COLLECTED", {
+        types: requiredContext,
+        includesSemantic: !!this.semanticState,
+        includesMemory: !!this.memory,
+        estimatedTokens: planningContext.estimatedTokens,
+        tokenBudget: planningContext.tokenBudget
+      });
       await this.persistSession(session);
 
       // Memory influences planning: surface the ranked, relevant memories that
@@ -190,7 +217,7 @@ export class AgentRuntime {
       session.currentState = RuntimeState.GENERATE_PLAN;
       session.plan = await this.generalPlanner.generatePlan(
         session.intent,
-        baseContext,
+        planningContext,
         semanticContext,
         relevantMemory,
         { priorProcedures, priorFailures }
@@ -264,6 +291,25 @@ export class AgentRuntime {
     }
   }
 
+  // Issue capability grants for a plan's task graph. One grant is issued per task
+  // occurrence, so a plan with N tasks using the same single-use capability gets
+  // N single-use grants — each consumed by exactly one task. Session-reusable
+  // grants are validated but never consumed, so extra copies are harmless.
+  // No-op when the broker has no grant store (lightweight/test wiring).
+  async _issuePlanGrants(session, plan) {
+    if (typeof this.permissionBroker?.grantPlanCapabilities !== "function") return;
+    const tasks = plan?.taskGraph?.tasks ?? [];
+    const capabilities = [];
+    for (const task of tasks) {
+      const name = task.capability ?? task.selectedCapability;
+      if (!name) continue;
+      const capability = this.capabilityRegistry?.get(name);
+      if (capability) capabilities.push(capability);
+    }
+    if (capabilities.length === 0) return;
+    await this.permissionBroker.grantPlanCapabilities({ sessionId: session.sessionId, capabilities });
+  }
+
   // The single canonical execution pipeline. Runs the plan's task graph through
   // the TaskGraphScheduler: checkpoint -> execute -> observe -> verify, with
   // bounded replanning on verification failure. Both fresh intents
@@ -274,14 +320,38 @@ export class AgentRuntime {
     const MAX_REPLAN_ATTEMPTS = options.MAX_REPLAN_ATTEMPTS ?? 2;
     const originalPlan = options.originalPlan ?? session.plan;
 
+    // Issue authoritative capability grants for the approved plan before any
+    // task runs. Deny-by-default enforcement in the pipeline's authorize()
+    // callback consumes these; without a grant a capability cannot execute even
+    // though the session and policy approval exist.
+    await this._issuePlanGrants(session, session.plan);
+
     this.taskGraphScheduler.initialize(session.plan.taskGraph);
 
     while (!this.taskGraphScheduler.isComplete()) {
       const readyTasks = this.taskGraphScheduler.getReadyTasks();
 
       for (const task of readyTasks) {
-        const cap = this.capabilityRegistry.get(task.capability);
-        if (!cap) throw new Error(`Unknown capability ${task.capability}`);
+        let cap;
+        try {
+          cap = await this.capabilityRegistry.pipeline.prepare(task, {
+            platform: process.platform,
+            privilegeApproved: session.policyDecision?.effect !== PolicyEffect.DENY,
+            authorize: async (candidate) => this.permissionBroker.evaluateCapability({
+              capability: candidate,
+              approved: session.policyDecision?.effect !== PolicyEffect.DENY,
+              sessionId: session.sessionId,
+              grantedPermissions: session.grantedPermissions ?? null
+            })
+          });
+        } catch (error) {
+          await this.addSessionEvent(session, "CAPABILITY_PREFLIGHT_FAILED", {
+            taskId: task.taskId,
+            capability: task.capability,
+            error: error.message
+          });
+          throw error;
+        }
 
         await this.addSessionEvent(session, "TASK_STARTING", {
           taskId: task.taskId,
@@ -294,14 +364,30 @@ export class AgentRuntime {
           continue;
         }
 
-        // Create a checkpoint before the first mutating, rollback-supported task.
-        if (cap.reversibility === "ROLLBACK_SUPPORTED" && !session.checkpoint) {
-          await this.addSessionEvent(session, "CREATING_CHECKPOINT", { taskId: task.taskId });
-          session.checkpoint = await this.createCheckpoint(session.intent.entities.workspacePath || process.cwd());
+        if (cap.reversibility === "ROLLBACK_SUPPORTED") {
+          await this.addSessionEvent(session, "CREATING_CHECKPOINT", { taskId: task.taskId, capability: task.capability });
+          const rollbackRecord = await this.rollbackManager.capture(task);
+          session.rollback.records.push(rollbackRecord);
+          await this.addSessionEvent(session, "CAPABILITY_ROLLBACK_REGISTERED", { taskId: task.taskId, capability: task.capability });
           await this.persistSession(session);
         }
 
-        const { verification, observation, executionResult } = await this.taskGraphScheduler.executeTask(task);
+        // Secret injection (Phase 9): if the capability declares requiredSecrets,
+        // resolve the actual values from the DPAPI broker into the task inputs
+        // ONLY for the moment of execution. Secrets never reach the planner,
+        // reasoning engine, prompts, or audit; the plan/observations carry secret
+        // references (names), not values. We restore the reference-only inputs
+        // immediately after execution so nothing secret is persisted.
+        const injectedSecrets = await this._resolveSecretsForTask(cap, task, session);
+
+        let execution;
+        try {
+          execution = await this.taskGraphScheduler.executeTask(task);
+        } finally {
+          // Scrub even if execution throws during observation or verification.
+          if (injectedSecrets) this._scrubInjectedSecrets(task, injectedSecrets);
+        }
+        const { verification, observation, executionResult } = execution;
 
         session.taskResults.push({ taskId: task.taskId, capability: task.capability, executionResult });
         session.observations.push(observation);
@@ -310,6 +396,39 @@ export class AgentRuntime {
         await this.addSessionEvent(session, "TASK_EXECUTED", { taskId: task.taskId, result: executionResult });
         await this.addSessionEvent(session, "OBSERVATION_COLLECTED", observation);
         await this.addSessionEvent(session, "VERIFICATION_COMPLETED", verification);
+        const lifecycleResult = await this.capabilityRegistry.pipeline.recordResult(task, execution);
+        for (const auditEvent of lifecycleResult.auditEvents) {
+          await this.addSessionEvent(session, "CAPABILITY_AUDIT_EVENT", { taskId: task.taskId, capability: task.capability, auditEvent });
+        }
+        if (lifecycleResult.semanticUpdates.length > 0) {
+          await this.addSessionEvent(session, "CAPABILITY_SEMANTIC_UPDATES_REGISTERED", {
+            taskId: task.taskId,
+            capability: task.capability,
+            updates: lifecycleResult.semanticUpdates
+          });
+        }
+        if (this.memory && lifecycleResult.memoryUpdates.length > 0 &&
+            (verification.status === "VERIFIED" || verification.status === "PARTIALLY_VERIFIED")) {
+          for (const update of lifecycleResult.memoryUpdates) {
+            await this.memory.store({
+              id: createId("capability_memory"),
+              type: update.type ?? "SYSTEM_HISTORY",
+              content: { update, taskId: task.taskId, capability: task.capability, executionResult },
+              summary: update.summary ?? `Capability memory update: ${task.capability}`,
+              provenance: `capability:${task.capability}`,
+              confidence: update.confidence ?? 1,
+              sensitivity: update.sensitivity ?? "LOW",
+              createdAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+              expiresAt: update.expiresAt ?? null,
+              relatedEntities: [],
+              relatedSession: session.sessionId,
+              relatedIntent: session.intent?.id,
+              verifiedSuccess: true
+            });
+          }
+          await this.addSessionEvent(session, "CAPABILITY_MEMORY_UPDATED", { taskId: task.taskId, capability: task.capability });
+        }
 
         // Every observation flows through Perception (the sole writer to the
         // world model). Verified mutating tasks record their action effects —
@@ -320,9 +439,19 @@ export class AgentRuntime {
             (verification.status === "VERIFIED" || verification.status === "PARTIALLY_VERIFIED") &&
             Array.isArray(observation?.detectedChanges) && observation.detectedChanges.length > 0
           ) {
+            // Semantic action-effect persistence must not fail silently. If it
+            // throws, record an observable audit event; the task still verified,
+            // so this degrades the semantic record without failing the task, but
+            // the failure is never invisible.
             try {
               await this.perception.recordEffects(task.taskId, written.entities ?? [], written.relationships ?? []);
-            } catch { /* effect recording is best-effort */ }
+            } catch (effectError) {
+              await this.addSessionEvent(session, "SEMANTIC_EFFECT_PERSISTENCE_FAILED", {
+                taskId: task.taskId,
+                capability: task.capability,
+                error: effectError instanceof Error ? effectError.message : String(effectError)
+              });
+            }
           }
         }
 
@@ -350,6 +479,9 @@ export class AgentRuntime {
             const preserveStates = handleResult.preserveStates instanceof Map
               ? handleResult.preserveStates
               : this.taskGraphScheduler.captureCompletedStates();
+            // The replan may introduce new capabilities; grant them before the
+            // scheduler restarts against the new graph.
+            await this._issuePlanGrants(session, session.plan);
             this.taskGraphScheduler.initialize(session.plan.taskGraph, { preserveStates });
             // Restart the scheduling loop against the new plan rather than
             // continuing to iterate ready tasks from the old graph.
@@ -397,15 +529,29 @@ export class AgentRuntime {
         semanticSnapshot = sg.entities;
       } catch { /* best-effort */ }
     }
+    // The GoalVerifier independently corroborates the scheduler's terminal status
+    // against per-task verifications. It MUST see the scheduler's RECONCILED
+    // current verifications (one per task, post-replan) — not session.verifications,
+    // which is an accumulating history that still holds superseded FAILED entries
+    // from before a successful replan. Fall back to the history only if the
+    // scheduler can't provide the reconciled view.
+    const reconciledVerifications = typeof this.taskGraphScheduler.getReconciledVerifications === "function"
+      ? this.taskGraphScheduler.getReconciledVerifications()
+      : session.verifications;
     const finalVerification = this.goalVerifier.verify({
       intent: session.intent,
       taskGraph: session.plan?.taskGraph,
       schedulerStatus: finalStatus,
-      verifications: session.verifications,
+      verifications: reconciledVerifications,
       observations: session.observations,
+      taskResults: session.taskResults,
       semanticState: semanticSnapshot
     });
-    const goalVerified = finalVerification.status === "COMPLETED";
+    // A goal that completed with warnings is still a success for the purpose of
+    // recording an episodic (reusable) memory; only PARTIAL/FAILED/INCONCLUSIVE
+    // are non-successes.
+    const goalVerified = finalVerification.status === "COMPLETED" ||
+      finalVerification.status === "COMPLETED_WITH_WARNINGS";
 
     if (this.memory) {
       session.currentState = RuntimeState.UPDATE_MEMORY;
@@ -495,11 +641,41 @@ export class AgentRuntime {
     // state so the runtime never assumes success.
     const goalStateMap = {
       COMPLETED: RuntimeState.COMPLETED,
+      // A goal completed with warnings still met its success criteria; it is a
+      // success terminal state, distinguished only by the warnings in the
+      // final response and goal verification evidence.
+      COMPLETED_WITH_WARNINGS: RuntimeState.COMPLETED,
       PARTIALLY_COMPLETED: RuntimeState.FAILED,
       INCONCLUSIVE: RuntimeState.FAILED,
       FAILED: RuntimeState.FAILED
     };
     session.currentState = goalStateMap[finalVerification.status] ?? RuntimeState.FAILED;
+
+    // EXECUTION SUMMARIZATION (Phase 7): the runtime produces FACTS; the
+    // ReasoningEngine phrases them. It never fabricates outcomes, and always
+    // returns a summary (deterministic template when no/failed model), so this
+    // never blocks completion.
+    let executionSummary = null;
+    try {
+      const facts = {
+        status: finalVerification.status,
+        taskCount: session.taskResults.length,
+        changesMade: session.observations
+          .filter((o) => Array.isArray(o?.detectedChanges) && o.detectedChanges.length > 0)
+          .flatMap((o) => o.detectedChanges),
+        recoveriesPerformed: (session.recoveryBudget?.attempts ?? []).map((a) => a.action),
+        remainingProblems: session.verifications
+          .filter((v) => v && v.status !== "VERIFIED" && v.status !== "PARTIALLY_VERIFIED")
+          .map((v) => v.message)
+      };
+      const summaryResult = await this.reasoningEngine.summarizeExecution(facts);
+      if (summaryResult.ok) {
+        executionSummary = { ...summaryResult.data, source: summaryResult.source };
+      }
+    } catch {
+      executionSummary = null;
+    }
+
     session.finalResponse = {
       status: finalVerification.status,
       message: finalVerification.message,
@@ -507,7 +683,8 @@ export class AgentRuntime {
       verifications: session.verifications,
       finalStatus,
       finalVerification,
-      rollbackAvailable: Boolean(session.checkpoint)
+      summary: executionSummary,
+      rollbackAvailable: (session.rollback?.records?.length ?? 0) > 0
     };
     await this.persistSession(session);
     return session;
@@ -517,7 +694,7 @@ export class AgentRuntime {
   // -> act (retry / replan preserving completed work / rollback / abort).
   async handleTaskFailure(session, task, verification, options = {}) {
     const { replanAttempts = 0, MAX_REPLAN_ATTEMPTS = 2, originalPlan } = options;
-    session.recoveryBudget = session.recoveryBudget ?? { total: 6, spent: 0, attempts: [] };
+    session.recoveryBudget = createRecoveryBudget(session.recoveryBudget);
 
     await this.addSessionEvent(session, "TASK_FAILED", {
       taskId: task.taskId,
@@ -536,10 +713,25 @@ export class AgentRuntime {
           executionResult,
           observation,
           semanticState: session.context?.semanticState,
-          memory: session.context?.memory
+          memory: session.context?.memory,
+          attempt: session.recoveryBudget.spent,
+          recoveryBudgetRemaining: session.recoveryBudget.total - session.recoveryBudget.spent
         })
       : { category: "unexpected", rootCause: "No diagnosis engine", confidence: 0.1, suggestedRecovery: "abort" };
     await this.addSessionEvent(session, "FAILURE_DIAGNOSED", diagnosis);
+
+    // Model reasoning is advisory and auditable. The deterministic diagnosis
+    // and RecoveryEngine still decide what the runtime may execute.
+    const failureReasoning = await this.reasoningEngine.reasonAboutFailure({
+      diagnosis,
+      task,
+      verification,
+      executionResult,
+      observation,
+      semanticState: session.context?.semanticState,
+      memory: session.context?.memory
+    });
+    if (failureReasoning.ok) await this.addSessionEvent(session, "FAILURE_REASONING_ADVICE", failureReasoning.data);
 
     // 2. RECOVER — decide the next recovery action within budget.
     const decision = this.recoveryEngine.recover({
@@ -549,6 +741,14 @@ export class AgentRuntime {
       maxReplanAttempts: MAX_REPLAN_ATTEMPTS
     });
     session.recoveryBudget = decision.budget;
+    const recoveryReasoning = await this.reasoningEngine.reasonAboutRecovery({
+      diagnosis,
+      task,
+      verification,
+      completedTasks: [...this.taskGraphScheduler.captureCompletedStates().keys()],
+      recoveryBudgetRemaining: decision.budget.total - decision.budget.spent
+    });
+    if (recoveryReasoning.ok) await this.addSessionEvent(session, "RECOVERY_REASONING_ADVICE", recoveryReasoning.data);
     await this.addSessionEvent(session, "RECOVERY_DECIDED", {
       action: decision.action,
       reason: decision.reason,
@@ -603,6 +803,15 @@ export class AgentRuntime {
       if (this.memory) {
         relevantMemory = await this.memory.retrieveRelevant(session.intent);
       }
+      const planningContext = this.contextEngine.buildPlanningContext({
+        intent: session.intent,
+        baseContext,
+        semanticSubgraph: { entities: semanticContext, relationships: [] },
+        memory: relevantMemory,
+        capabilityRegistry: this.capabilityRegistry,
+        policyConstraints: session.intent.constraints,
+        recoveryBudget: session.recoveryBudget
+      });
 
       const completedStates = this.taskGraphScheduler.captureCompletedStates();
       const completedTaskIds = [...completedStates.keys()];
@@ -610,7 +819,7 @@ export class AgentRuntime {
       session.currentState = RuntimeState.GENERATE_PLAN;
       const newPlan = await this.generalPlanner.generatePlan(
         session.intent,
-        baseContext,
+        planningContext,
         semanticContext,
         relevantMemory,
         {
@@ -646,16 +855,17 @@ export class AgentRuntime {
   }
 
   async _handleFailureWithoutReplan(session, task, verification, diagnosis = null) {
-    if (session.checkpoint) {
+    if ((session.rollback?.records?.length ?? 0) > 0) {
       session.currentState = RuntimeState.ROLLING_BACK;
       await this.addSessionEvent(session, "ROLLING_BACK", { taskId: task.taskId });
-      await this._rollbackSession(session);
+      const rollbackResult = await this._rollbackSession(session);
       session.currentState = RuntimeState.ROLLED_BACK;
       session.finalResponse = {
         status: "ROLLED_BACK",
         message: `Task ${task.taskId} failed, rolled back`,
         verification,
-        diagnosis
+        diagnosis,
+        rollbackResult
       };
     } else {
       session.currentState = RuntimeState.FAILED;
@@ -907,6 +1117,8 @@ export class AgentRuntime {
     if (!Array.isArray(session.observations)) session.observations = [];
     if (!Array.isArray(session.verifications)) session.verifications = [];
     if (!Array.isArray(session.events)) session.events = [];
+    if (!session.rollback) session.rollback = { records: [], completed: false, result: null };
+    session.recoveryBudget = createRecoveryBudget(session.recoveryBudget);
 
     try {
       session.currentState = RuntimeState.EXECUTING;
@@ -1032,28 +1244,88 @@ export class AgentRuntime {
     await this.sessionStore.save(session);
   }
 
-  async createCheckpoint(workspacePath) {
-    const inspection = await this.adapter.inspectProjectEnvironment(workspacePath);
-    return {
-      checkpointId: createId("checkpoint"),
-      filePath: inspection.filePath,
-      existed: inspection.exists,
-      previousContents: inspection.rawContents
-    };
+  // Phase 9 secret injection. A capability may declare `requiredSecrets`: an
+  // array of { inputKey, ref } (or the task may carry inputs.secretRefs mapping
+  // inputKey -> secretRef). We resolve each ref via the DPAPI broker and place
+  // the plaintext into task.inputs[inputKey] transiently, returning the list of
+  // keys we set so the caller can scrub them after execution. Returns null when
+  // there is nothing to inject or no broker is configured.
+  async _resolveSecretsForTask(capability, task, session) {
+    if (!this.secretBroker) return null;
+    const specs = [];
+    if (Array.isArray(capability?.requiredSecrets)) {
+      for (const s of capability.requiredSecrets) {
+        if (s?.inputKey && s?.ref) specs.push({ inputKey: s.inputKey, ref: s.ref });
+      }
+    }
+    // Task-level references: inputs.secretRefs = { inputKey: secretRef }.
+    const refMap = task?.inputs?.secretRefs;
+    if (refMap && typeof refMap === "object") {
+      for (const [inputKey, ref] of Object.entries(refMap)) {
+        if (inputKey && ref) specs.push({ inputKey, ref });
+      }
+    }
+    if (specs.length === 0) return null;
+
+    task.inputs = task.inputs || {};
+    const injectedKeys = [];
+    for (const { inputKey, ref } of specs) {
+      try {
+        const value = await this.secretBroker.retrieveSecret(ref);
+        task.inputs[inputKey] = value;
+        injectedKeys.push(inputKey);
+      } catch {
+        // A missing/unreadable secret is surfaced to the capability as absence;
+        // verification will fail and the closed loop handles it. We never log
+        // the ref value itself.
+        await this.addSessionEvent(session, "SECRET_RESOLUTION_FAILED", { taskId: task.taskId, inputKey });
+      }
+    }
+    if (injectedKeys.length > 0) {
+      await this.addSessionEvent(session, "SECRETS_INJECTED", { taskId: task.taskId, keys: injectedKeys });
+    }
+    return injectedKeys.length ? injectedKeys : null;
   }
 
-  // Canonical rollback. Restores the workspace .env checkpoint captured by
-  // createCheckpoint before the first mutating task. This is the single rollback
-  // path used by both automatic failure handling and manual session rollback.
-  async _rollbackSession(session) {
-    const checkpoint = session.checkpoint;
-    if (!checkpoint || checkpoint.filePath === undefined) {
-      return { rolledBack: false, reason: "No checkpoint available." };
+  // Remove injected plaintext secrets from task.inputs after execution so they
+  // are never persisted with the session.
+  _scrubInjectedSecrets(task, injectedKeys) {
+    if (!task?.inputs) return;
+    for (const key of injectedKeys) {
+      delete task.inputs[key];
     }
-    await this.adapter.restoreEnvFile(checkpoint.filePath, checkpoint.previousContents);
-    await this.auditRepository.append(session.sessionId, "ROLLBACK_COMPLETED", {
-      filePath: checkpoint.filePath
-    });
-    return { rolledBack: true, filePath: checkpoint.filePath };
+  }
+
+  async _rollbackSession(session) {
+    const rollback = session.rollback;
+    if (!rollback?.records?.length) return { rolledBack: false, reason: "No rollback records available." };
+    if (rollback.completed) return rollback.result;
+
+    const result = await this.rollbackManager.rollback(rollback.records);
+    rollback.completed = true;
+    rollback.result = result;
+    for (const entry of result.entries) {
+      await this.addSessionEvent(session, entry.status === "ROLLED_BACK" ? "ROLLBACK_COMPLETED" : "ROLLBACK_FAILED", entry);
+    }
+    if (this.perception) {
+      try {
+        await this.perception.perceive({ workspacePath: session.intent?.entities?.workspacePath });
+        await this.perception.snapshot(`rollback:${session.sessionId}`);
+      } catch { /* rollback state is still recorded even when perception is unavailable */ }
+    }
+    if (this.memory) {
+      await this.memory.store({
+        id: createId("memory"),
+        type: "SYSTEM_HISTORY",
+        content: { sessionId: session.sessionId, rollback: result },
+        summary: `Rollback ${result.rolledBack ? "completed" : "partially failed"} for session ${session.sessionId}`,
+        provenance: "rollback",
+        confidence: result.rolledBack ? 1 : 0.5,
+        sensitivity: "LOW",
+        relatedSession: session.sessionId
+      });
+    }
+    await this.persistSession(session);
+    return result;
   }
 }

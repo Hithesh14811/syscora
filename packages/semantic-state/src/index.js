@@ -7,10 +7,39 @@ import crypto from "node:crypto";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// A process-unique token that marks the single controlled writer. Perception
+// obtains it via authorizeWriter(); every mutation method requires it once a
+// writer has been authorized, so no other subsystem can mutate the world model
+// even though the low-level methods remain on the class.
+const WRITER_TOKEN = Symbol("semantic-state-writer");
+
 export class SemanticState {
   constructor(baseDirectory) {
     this.baseDirectory = baseDirectory;
     this.dbPath = path.join(baseDirectory, "semantic-state.sqlite");
+    // Null until a controlled writer claims ownership. When null, writes are
+    // allowed (test/direct-construction convenience); once claimed, every
+    // mutation must present the writer token.
+    this._writerClaimed = false;
+  }
+
+  // Claim single-writer ownership. Returns the token the controlled writer
+  // (PerceptionEngine) must present on every mutation. Idempotent per process:
+  // the same token is returned so re-wiring perception (e.g. after attaching
+  // developer intelligence) does not lock out the existing writer.
+  authorizeWriter() {
+    this._writerClaimed = true;
+    return WRITER_TOKEN;
+  }
+
+  // Enforce the single-writer invariant. Once a writer has been authorized,
+  // every mutation must present the token; unauthorized writes throw.
+  _assertWriter(token, method) {
+    if (this._writerClaimed && token !== WRITER_TOKEN) {
+      throw new Error(
+        `SemanticState.${method} is a controlled write; only the authorized Perception writer may mutate the world model.`
+      );
+    }
   }
 
   async ensureSchema() {
@@ -67,7 +96,8 @@ export class SemanticState {
     }
   }
 
-  async upsertEntity(entity) {
+  async upsertEntity(entity, token = undefined) {
+    this._assertWriter(token, "upsertEntity");
     await this.ensureSchema();
     const db = new DatabaseSync(this.dbPath);
     const now = new Date().toISOString();
@@ -106,7 +136,8 @@ export class SemanticState {
     }
   }
 
-  async upsertRelationship(relationship) {
+  async upsertRelationship(relationship, token = undefined) {
+    this._assertWriter(token, "upsertRelationship");
     await this.ensureSchema();
     const db = new DatabaseSync(this.dbPath);
     const now = new Date().toISOString();
@@ -245,7 +276,8 @@ export class SemanticState {
     return { relationships, entities };
   }
 
-  async markStale(entityId, staleAfter = new Date().toISOString()) {
+  async markStale(entityId, staleAfter = new Date().toISOString(), token = undefined) {
+    this._assertWriter(token, "markStale");
     await this.ensureSchema();
     const db = new DatabaseSync(this.dbPath);
 
@@ -259,7 +291,8 @@ export class SemanticState {
     }
   }
 
-  async createSnapshot(sessionId, entityIds, relationshipIds) {
+  async createSnapshot(sessionId, entityIds, relationshipIds, token = undefined) {
+    this._assertWriter(token, "createSnapshot");
     await this.ensureSchema();
     const db = new DatabaseSync(this.dbPath);
     const id = `snapshot_${crypto.randomUUID()}`;
@@ -290,8 +323,37 @@ export class SemanticState {
     }
   }
 
-  async recordActionEffects(actionId, entityIds, relationshipIds) {
-    return this.createSnapshot(`action_${actionId}`, entityIds, relationshipIds);
+  async recordActionEffects(actionId, entityIds, relationshipIds, token = undefined) {
+    // Action-effect persistence is a controlled write: it goes through
+    // createSnapshot, which enforces the single-writer token. The token MUST be
+    // forwarded here — omitting it made every recordActionEffects call throw once
+    // Perception had claimed the writer, and the effect was silently lost.
+    this._assertWriter(token, "recordActionEffects");
+    return this.createSnapshot(`action_${actionId}`, entityIds, relationshipIds, token);
+  }
+
+  // Read a persisted snapshot by its session/action id. Read-only, so it needs
+  // no writer token. Returns { id, sessionId, timestamp, entityIds,
+  // relationshipIds } or null. Used to confirm action-effect persistence.
+  async getSnapshot(sessionId) {
+    await this.ensureSchema();
+    const db = new DatabaseSync(this.dbPath);
+    try {
+      const row = db.prepare(
+        `SELECT id, session_id, timestamp, entity_ids, relationship_ids
+         FROM system_snapshots WHERE session_id = ? ORDER BY timestamp DESC LIMIT 1`
+      ).get(sessionId);
+      if (!row) return null;
+      return {
+        id: row.id,
+        sessionId: row.session_id,
+        timestamp: row.timestamp,
+        entityIds: JSON.parse(row.entity_ids ?? "[]"),
+        relationshipIds: JSON.parse(row.relationship_ids ?? "[]")
+      };
+    } finally {
+      db.close();
+    }
   }
 
   async getRelevantState(intent, contextBudget = 100) {
@@ -322,6 +384,7 @@ export class SemanticState {
   }
 
   async ingestContext(contextItems) {
+    throw new Error("SemanticState.ingestContext is deprecated; send context through PerceptionEngine.perceive().");
     const entities = [];
     const relationships = [];
     const now = new Date().toISOString();
@@ -360,6 +423,7 @@ export class SemanticState {
   }
 
   async ingestObservations(observations) {
+    throw new Error("SemanticState.ingestObservations is deprecated; send observations through PerceptionEngine.ingestObservation().");
     const updatedEntities = [];
     const now = new Date().toISOString();
 

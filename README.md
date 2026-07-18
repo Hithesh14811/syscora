@@ -9,10 +9,10 @@ This repository currently contains the first secure MVP vertical slice:
 - capability selection from a registry
 - deterministic risk and policy evaluation
 - approval gating
-- typed execution through a Linux-oriented project environment adapter
+- typed execution through Windows adapter-backed capabilities
 - structured observation and verification
 - append-only audit events
-- rollback support for `.env` changes
+- capability-driven rollback for supported project environment, user environment, PATH, and file changes
 - session persistence across daemon restarts
 - local MVP desktop-style frontend served by daemon
 

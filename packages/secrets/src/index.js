@@ -36,12 +36,23 @@ export class WindowsSecretBroker {
     const secretRef = `secret_${crypto.randomUUID()}`;
     const dpapiPath = path.join(this.baseDirectory, `${secretRef}.bin`);
     const { spawn } = await import("node:child_process");
+    // The plaintext secret is NEVER placed on the command line (where it would be
+    // visible to any process that can enumerate command lines). It is passed via a
+    // child-process environment variable and read by the script; only the DPAPI
+    // output path is a literal. A process's environment is not readable by other
+    // non-elevated users, and the child exits immediately.
     const script =
-      `$bytes = [Text.Encoding]::UTF8.GetBytes('${escapePs(value)}'); ` +
+      `Add-Type -AssemblyName System.Security; ` +
+      `$plain = $env:SYSCORA_SECRET_PLAINTEXT; ` +
+      `$bytes = [Text.Encoding]::UTF8.GetBytes($plain); ` +
       `$prot = [System.Security.Cryptography.ProtectedData]::Protect($bytes,$null,[System.Security.Cryptography.DataProtectionScope]::CurrentUser); ` +
       `[IO.File]::WriteAllBytes('${escapePs(dpapiPath)}',$prot)`;
     await new Promise((resolve, reject) => {
-      const child = spawn("powershell.exe", ["-NoProfile", "-Command", script], { stdio: "ignore" });
+      const child = spawn("powershell.exe", ["-NoProfile", "-Command", script], {
+        stdio: ["ignore", "ignore", "pipe"],
+        env: { ...process.env, SYSCORA_SECRET_PLAINTEXT: String(value) }
+      });
+      child.on("error", reject);
       child.on("close", (code) => (code === 0 ? resolve() : reject(new Error("DPAPI protect failed"))));
     });
     const db = new DatabaseSync(this.databasePath);
@@ -60,6 +71,7 @@ export class WindowsSecretBroker {
     const dpapiPath = path.join(this.baseDirectory, `${secretRef}.bin`);
     const { spawn } = await import("node:child_process");
     const script =
+      `Add-Type -AssemblyName System.Security; ` +
       `$prot = [IO.File]::ReadAllBytes('${escapePs(dpapiPath)}'); ` +
       `$bytes = [System.Security.Cryptography.ProtectedData]::Unprotect($prot,$null,[System.Security.Cryptography.DataProtectionScope]::CurrentUser); ` +
       `[Text.Encoding]::UTF8.GetString($bytes)`;

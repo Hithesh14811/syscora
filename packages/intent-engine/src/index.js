@@ -1,5 +1,5 @@
-import { redactSensitiveData } from "../../shared-types/src/redaction.js";
 import { validateSchema } from "../../model-providers/src/index.js";
+import { ReasoningEngine } from "../../reasoning-engine/src/index.js";
 import crypto from "crypto";
 const createId = () => crypto.randomBytes(16).toString("hex");
 
@@ -14,8 +14,13 @@ const USER_INTENT_SCHEMA = {
     operation: { type: "string" },
     entities: { type: "object" },
     constraints: { type: "array", items: { type: "string" } },
+    preferences: { type: "array", items: { type: "string" } },
+    assumptions: { type: "array", items: { type: "string" } },
+    unknowns: { type: "array", items: { type: "string" } },
     successCriteria: { type: "array", items: { type: "string" } },
     requiredContext: { type: "array", items: { type: "string" } },
+    requiredCapabilities: { type: "array", items: { type: "string" } },
+    confidence: { type: "number" },
     ambiguity: { type: "boolean" },
     clarificationQuestions: { type: "array", items: { type: "string" } },
     sensitivityFlags: { type: "array", items: { type: "string" } }
@@ -23,8 +28,20 @@ const USER_INTENT_SCHEMA = {
 };
 
 export class IntentEngine {
-  constructor(modelProvider) {
-    this.modelProvider = modelProvider;
+  // Accepts either a ReasoningEngine (preferred — the single model boundary) or,
+  // for backward compatibility, a raw modelProvider. When a reasoningEngine is
+  // present, all model interaction goes through it; otherwise the deterministic
+  // classifier below is authoritative.
+  constructor(modelProviderOrReasoning) {
+    if (modelProviderOrReasoning && typeof modelProviderOrReasoning.understandIntent === "function") {
+      this.reasoningEngine = modelProviderOrReasoning;
+    } else {
+      // Compatibility callers may still supply a provider, but it is wrapped
+      // immediately so IntentEngine never communicates with it directly.
+      this.reasoningEngine = modelProviderOrReasoning
+        ? new ReasoningEngine({ modelProvider: modelProviderOrReasoning })
+        : null;
+    }
   }
 
   async classify(rawText, context = {}) {
@@ -51,8 +68,13 @@ export class IntentEngine {
           ...(context.entities || {})
         },
         constraints: [],
+        preferences: [],
+        assumptions: [],
+        unknowns: [],
         successCriteria: Array.isArray(context.successCriteria) ? context.successCriteria : ["Operation completed and verified"],
         requiredContext: Array.isArray(context.requiredContext) ? context.requiredContext : [],
+        requiredCapabilities: [],
+        confidence: 1,
         ambiguity: false,
         clarificationQuestions: [],
         sensitivityFlags: []
@@ -64,45 +86,15 @@ export class IntentEngine {
       return intent;
     }
 
-    if (this.modelProvider) {
-      try {
-        const prompt = `
-          Parse this Windows computer task request into structured intent.
-          
-          Request: ${text}
-          
-          Return JSON with:
-          - normalizedGoal: clear goal description
-          - category: one of SYSTEM, PROJECT, APPLICATION, BROWSER, DEVELOPER, ENVIRONMENT
-          - entities: key-value pairs of extracted parameters
-          - successCriteria: array of strings to verify the goal is met
-          - requiredContext: array of context types needed (system, processes, port, environment, workspace, filesystem)
-          - ambiguity: boolean (true if request is unclear)
-          - clarificationQuestions: array of strings if ambiguous
-        `.trim();
-        const redactedPrompt = redactSensitiveData({ prompt });
-        modelResult = await this.modelProvider.generateStructured(
-          redactedPrompt.prompt,
-          {
-            type: "object",
-            required: ["normalizedGoal", "category", "entities", "successCriteria"],
-            properties: {
-              normalizedGoal: { type: "string" },
-              category: { type: "string" },
-              entities: { type: "object" },
-              constraints: { type: "array", items: { type: "string" } },
-              successCriteria: { type: "array", items: { type: "string" } },
-              requiredContext: { type: "array", items: { type: "string" } },
-              ambiguity: { type: "boolean" },
-              clarificationQuestions: { type: "array", items: { type: "string" } },
-              sensitivityFlags: { type: "array", items: { type: "string" } }
-            }
-          },
-          { validateSchema: true, timeoutMs: 30000 }
-        );
-      } catch (e) {
-        // Fallback to deterministic classifier if model fails
-        console.warn("Model-based intent classification failed, falling back to deterministic:", e);
+    // Reasoning-first: delegate to the ReasoningEngine when configured. It owns
+    // all model interaction, schema validation and bounded repair, and returns
+    // { ok, data } — never throwing — so a failure here silently falls through
+    // to the deterministic classifier below. The runtime never trusts the model
+    // directly; whatever comes back is merged into a validated UserIntent.
+    if (this.reasoningEngine) {
+      const result = await this.reasoningEngine.understandIntent(text, context);
+      if (result?.ok) {
+        modelResult = result.data;
       }
     }
 
@@ -119,12 +111,25 @@ export class IntentEngine {
         ...(modelResult?.entities || this.extractEntities(lower, text, context))
       },
       constraints: Array.isArray(modelResult?.constraints) ? modelResult.constraints : [],
+      preferences: Array.isArray(modelResult?.preferences) ? modelResult.preferences : [],
+      assumptions: Array.isArray(modelResult?.assumptions) ? modelResult.assumptions : [],
+      unknowns: Array.isArray(modelResult?.unknowns) ? modelResult.unknowns : [],
       successCriteria: Array.isArray(modelResult?.successCriteria) ? modelResult.successCriteria : this.getSuccessCriteria(lower),
       requiredContext: Array.isArray(modelResult?.requiredContext) ? modelResult.requiredContext : this.getRequiredContext(lower),
+      requiredCapabilities: Array.isArray(modelResult?.requiredCapabilities) ? modelResult.requiredCapabilities : [],
+      confidence: Number.isFinite(modelResult?.confidence) ? modelResult.confidence : (modelResult ? 0.7 : 1),
       ambiguity: modelResult?.ambiguity || false,
       clarificationQuestions: Array.isArray(modelResult?.clarificationQuestions) ? modelResult.clarificationQuestions : [],
       sensitivityFlags: Array.isArray(modelResult?.sensitivityFlags) ? modelResult.sensitivityFlags : []
     };
+
+    if (intent.confidence < 0.6 && this.reasoningEngine) {
+      const clarification = await this.reasoningEngine.clarifyIntent(text, context);
+      intent.ambiguity = true;
+      intent.clarificationQuestions = clarification.ok && clarification.data.questions.length
+        ? clarification.data.questions
+        : ["Please provide the missing target or desired outcome before execution."];
+    }
 
     // Validate schema
     const validation = validateSchema(intent, USER_INTENT_SCHEMA);

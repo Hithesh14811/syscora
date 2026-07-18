@@ -1,9 +1,10 @@
 import { PolicyEffect } from "../../shared-types/src/domain.js";
 
 export class PermissionBroker {
-  constructor({ approvalTokenStore = null, auditRepository = null } = {}) {
+  constructor({ approvalTokenStore = null, auditRepository = null, capabilityGrantStore = null } = {}) {
     this.approvalTokenStore = approvalTokenStore;
     this.auditRepository = auditRepository;
+    this.capabilityGrantStore = capabilityGrantStore;
   }
 
   evaluate({ policyDecision, autoApprove = false }) {
@@ -38,6 +39,118 @@ export class PermissionBroker {
         ? "Approval granted by caller."
         : "Approval required for this action."
     };
+  }
+
+  // Authoritative capability permission enforcement. Deny-by-default: a
+  // capability only executes when there is an active, unexpired, non-revoked
+  // grant that covers EVERY declared permission and whose scope matches the
+  // capability's permission model. Session existence alone is never sufficient.
+  //
+  // Resolution order:
+  //   1. Policy must not have denied the action (approved === true).
+  //   2. If a capabilityGrantStore + sessionId are present (the real runtime),
+  //      a stored grant is required and consumed according to its reuse policy.
+  //   3. Otherwise a caller may pass an explicit grantedPermissions set
+  //      (direct-call / unit-test path); every declared permission must appear.
+  async evaluateCapability({ capability, approved = false, grantedPermissions = null, sessionId = null } = {}) {
+    const name = capability?.name ?? capability?.capabilityId ?? "unknown";
+    const required = capability?.requirements?.permissions ?? capability?.permissions ?? [];
+    const model = capability?.permissionModel ?? null;
+
+    if (!approved) {
+      return { approved: false, required, reason: `Capability ${name} has not been approved by policy.` };
+    }
+
+    // Real runtime path: enforce against the persisted grant store.
+    if (this.capabilityGrantStore && sessionId) {
+      const decision = await this.capabilityGrantStore.check({
+        sessionId,
+        capability: name,
+        requiredPermissions: required,
+        scope: model?.scope ?? []
+      });
+      if (!decision.valid) {
+        await this.auditRepository?.append?.(sessionId, "CAPABILITY_GRANT_DENIED", {
+          capability: name,
+          required,
+          reason: decision.reason
+        });
+        return { approved: false, required, reason: decision.reason, missing: decision.missing };
+      }
+      // Consume single-use grants so a grant is never silently reused.
+      if (decision.grant?.reusePolicy === "SINGLE_USE") {
+        await this.capabilityGrantStore.consume(decision.grant.grantId);
+      }
+      await this.auditRepository?.append?.(sessionId, "CAPABILITY_GRANT_CONSUMED", {
+        capability: name,
+        grantId: decision.grant?.grantId,
+        reusePolicy: decision.grant?.reusePolicy
+      });
+      return { approved: true, required, reason: `Capability ${name} grant verified.`, grant: decision.grant };
+    }
+
+    // Direct-call path: an explicit grant set must cover every declared permission.
+    if (Array.isArray(grantedPermissions)) {
+      const missing = required.filter((permission) => !grantedPermissions.includes(permission));
+      if (missing.length > 0) {
+        return { approved: false, required, missing, reason: `Missing capability permissions: ${missing.join(", ")}` };
+      }
+      return { approved: true, required, reason: "Capability permissions approved." };
+    }
+
+    // Compatibility path: no grant store is configured, so authoritative
+    // deny-by-default enforcement is not in effect for this broker. The
+    // production runtime ALWAYS wires a capabilityGrantStore (see runtime
+    // factory), so it takes the grant-store branch above; this branch only
+    // applies to lightweight/legacy wiring where policy approval is the gate.
+    // Policy has already approved (checked at the top), so the capability runs.
+    return {
+      approved: true,
+      required,
+      reason: required.length === 0
+        ? `Capability ${name} declares no permissions.`
+        : `Capability ${name} approved by policy (no grant store configured for authoritative enforcement).`
+    };
+  }
+
+  // Issue capability grants for every capability in an approved plan. Called by
+  // the runtime immediately after policy/permission approval, before execution.
+  async grantPlanCapabilities({ sessionId, capabilities = [] }) {
+    if (!this.capabilityGrantStore || !sessionId) return [];
+    const issued = [];
+    for (const capability of capabilities) {
+      const name = capability?.name ?? capability?.capabilityId;
+      if (!name) continue;
+      const model = capability.permissionModel ?? {};
+      const grant = await this.capabilityGrantStore.grant({
+        sessionId,
+        capability: name,
+        permissions: capability?.requirements?.permissions ?? capability?.permissions ?? [],
+        scope: model.scope ?? [],
+        type: model.type ?? "READ",
+        reusePolicy: model.reusePolicy ?? "SESSION_REUSABLE",
+        lifetimeMs: model.approvalLifetimeMs ?? null
+      });
+      issued.push(grant);
+      await this.auditRepository?.append?.(sessionId, "CAPABILITY_GRANT_ISSUED", {
+        capability: name,
+        grantId: grant.grantId,
+        scope: grant.scope,
+        type: grant.type,
+        reusePolicy: grant.reusePolicy,
+        expiresAt: grant.expiresAt
+      });
+    }
+    return issued;
+  }
+
+  async revokeSessionCapabilities(sessionId, reason = "Session capabilities revoked.") {
+    if (!this.capabilityGrantStore || !sessionId) return 0;
+    const count = await this.capabilityGrantStore.revokeSession(sessionId);
+    if (count > 0) {
+      await this.auditRepository?.append?.(sessionId, "CAPABILITY_GRANTS_REVOKED", { count, reason });
+    }
+    return count;
   }
 
   evaluatePrivilegeEscalation({ operation, scope, approved = false }) {

@@ -2,6 +2,15 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 export class DeveloperIntelligenceEngine {
+  async inspectProject(workspacePath) {
+    const profile = await this.detectProject(workspacePath);
+    const [repository, packageManager] = await Promise.all([
+      this._inspectRepository(workspacePath),
+      this._inspectPackageManager(workspacePath, profile.packageManager)
+    ]);
+    return { ...profile, repository, packageManagerInspection: packageManager };
+  }
+
   async detectProject(workspacePath) {
     const packageJsonPath = path.join(workspacePath, "package.json");
     const pyprojectPath = path.join(workspacePath, "pyproject.toml");
@@ -76,5 +85,29 @@ export class DeveloperIntelligenceEngine {
       startScript: null,
       installRequired: false
     };
+  }
+
+  async _inspectRepository(workspacePath) {
+    try {
+      await fs.access(path.join(workspacePath, ".git"));
+      return { present: true, rootPath: workspacePath };
+    } catch {
+      return { present: false, rootPath: null };
+    }
+  }
+
+  async _inspectPackageManager(workspacePath, packageManager) {
+    const candidates = [
+      ["pnpm", "pnpm-lock.yaml"],
+      ["yarn", "yarn.lock"],
+      ["npm", "package-lock.json"]
+    ];
+    for (const [name, lockfile] of candidates) {
+      try {
+        await fs.access(path.join(workspacePath, lockfile));
+        return { name, lockfile: path.join(workspacePath, lockfile), detected: true };
+      } catch { /* try the next known lockfile */ }
+    }
+    return { name: packageManager, lockfile: null, detected: Boolean(packageManager) };
   }
 }

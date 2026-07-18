@@ -109,17 +109,41 @@ test("privileged helper approval token lifecycle is audited and single-use", asy
     });
     assert.equal(tokenResult.approved, true);
 
+    // Default execution mode is VALIDATE (read-only): an approved token alone
+    // never causes a destructive change. The result is a structured record of
+    // the bounded operation, not a fake success.
     const firstUse = await helper.execute("service.restart", "nginx", {
       sessionId: "priv_test",
       token: tokenResult.token
     });
-    assert.equal(firstUse.exitCode ?? 0, 0);
+    assert.equal(firstUse.operation, "service.restart");
+    assert.equal(firstUse.mode, "VALIDATE");
 
+    // The token is single-use: a second execution is rejected regardless of the
+    // validation outcome above.
     const secondUse = await helper.execute("service.restart", "nginx", {
       sessionId: "priv_test",
       token: tokenResult.token
     });
     assert.equal(secondUse.success, false);
+    assert.equal(secondUse.requiresApproval, true);
+
+    // The allow-list is authoritative: an unsupported operation is refused
+    // before any token is consumed.
+    const unsupported = await helper.execute("registry.delete", "HKLM:\\Foo", {
+      sessionId: "priv_test",
+      token: tokenResult.token
+    });
+    assert.equal(unsupported.success, false);
+    assert.match(unsupported.reason, /not in the allowed/);
+
+    // Strict scope validation: a scope carrying shell-like syntax is rejected.
+    const badScope = await helper.execute("service.restart", "nginx; rm -rf /", {
+      sessionId: "priv_test",
+      token: tokenResult.token
+    });
+    assert.equal(badScope.success, false);
+    assert.match(badScope.reason, /invalid characters/);
 
     const auditEvents = await auditRepository.readAll();
     assert.equal(auditEvents.some((event) => event.eventType === "PRIVILEGED_TOKEN_ISSUED"), true);
@@ -130,7 +154,7 @@ test("privileged helper approval token lifecycle is audited and single-use", asy
   }
 });
 
-test("privileged helper subprocess executes approved scoped operation", async () => {
+test("privileged helper subprocess enforces the scoped single-use token and safe default mode", async () => {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "syscora-priv-subprocess-"));
   try {
     const stateRoot = path.join(tempRoot, ".syscora");
@@ -169,9 +193,24 @@ test("privileged helper subprocess executes approved scoped operation", async ()
       });
     });
 
+    // The subprocess exits cleanly and returns a structured result. The default
+    // mode is VALIDATE: no destructive action is taken from an approved token
+    // alone, and the boundary never runs a shell string. On a machine without
+    // the demo service, validation reports it ineligible — either way the shape
+    // is a structured mode result, not a fabricated exit code.
     assert.equal(result.code, 0);
     const parsed = JSON.parse(result.stdout);
-    assert.equal(parsed.exitCode ?? 0, 0);
+    assert.equal(parsed.mode, "VALIDATE");
+    assert.equal(parsed.operation, "service.restart");
+
+    // The token is single-use: a second consume attempt is rejected.
+    const second = await broker.consumePrivilegeToken({
+      sessionId: "priv_sub",
+      token: tokenResult.token,
+      operation: "service.restart",
+      scope: "demo-service"
+    });
+    assert.equal(second.valid, false);
   } finally {
     await fs.rm(tempRoot, { recursive: true, force: true });
   }

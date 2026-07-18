@@ -41,7 +41,9 @@ export const PerceptionEvent = Object.freeze({
   RELATIONSHIP_CREATED: "RELATIONSHIP_CREATED",
   RELATIONSHIP_UPDATED: "RELATIONSHIP_UPDATED",
   SNAPSHOT_CREATED: "SNAPSHOT_CREATED",
-  ACTION_EFFECT_RECORDED: "ACTION_EFFECT_RECORDED"
+  SNAPSHOT_FAILED: "SNAPSHOT_FAILED",
+  ACTION_EFFECT_RECORDED: "ACTION_EFFECT_RECORDED",
+  ACTION_EFFECT_FAILED: "ACTION_EFFECT_FAILED"
 });
 
 export class PerceptionEngine {
@@ -53,6 +55,12 @@ export class PerceptionEngine {
     this.providers = providers;
     this.onEvent = typeof onEvent === "function" ? onEvent : null;
     this.events = [];
+    // Claim single-writer ownership of the world model. From here on, only this
+    // engine (presenting the returned token) may mutate SemanticState; any other
+    // caller's write throws. The token is process-local and never persisted.
+    this._writerToken = typeof semanticState?.authorizeWriter === "function"
+      ? semanticState.authorizeWriter()
+      : undefined;
   }
 
   static withDefaultProviders({ semanticState, adapter, developerIntelligence = null, onEvent = null }) {
@@ -79,7 +87,7 @@ export class PerceptionEngine {
     if (existing) {
       entity.firstSeenAt = existing.firstSeenAt ?? entity.firstSeenAt;
     }
-    await this.semanticState.upsertEntity(entity);
+    await this.semanticState.upsertEntity(entity, this._writerToken);
     this._emit(existing ? PerceptionEvent.ENTITY_UPDATED : PerceptionEvent.ENTITY_CREATED, {
       entityId: entity.id,
       entityType: entity.type,
@@ -91,7 +99,7 @@ export class PerceptionEngine {
   async _upsertRelationship(rel) {
     const existing = (await this.semanticState.queryRelationships({ ids: [rel.id] }))[0] ?? null;
     if (existing) rel.firstSeenAt = existing.firstSeenAt ?? rel.firstSeenAt;
-    await this.semanticState.upsertRelationship(rel);
+    await this.semanticState.upsertRelationship(rel, this._writerToken);
     this._emit(existing ? PerceptionEvent.RELATIONSHIP_UPDATED : PerceptionEvent.RELATIONSHIP_CREATED, {
       relationshipId: rel.id,
       type: rel.type,
@@ -199,12 +207,18 @@ export class PerceptionEngine {
       relationshipIds: relationships.map((r) => r.id),
       fingerprints
     };
-    // Persist the id sets via SemanticState's snapshot store.
+    // Persist the id sets via SemanticState's snapshot store. A persistence
+    // failure is surfaced as SNAPSHOT_FAILED (not silently dropped) so the
+    // runtime can audit that the world-model snapshot did not durably land.
     try {
-      const persisted = await this.semanticState.createSnapshot(label, snap.entityIds, snap.relationshipIds);
+      const persisted = await this.semanticState.createSnapshot(label, snap.entityIds, snap.relationshipIds, this._writerToken);
       snap.id = persisted?.id ?? null;
-    } catch { snap.id = null; }
-    this._emit(PerceptionEvent.SNAPSHOT_CREATED, { label, entities: snap.entityIds.length, relationships: snap.relationshipIds.length });
+    } catch (error) {
+      snap.id = null;
+      snap.persistenceError = error instanceof Error ? error.message : String(error);
+      this._emit(PerceptionEvent.SNAPSHOT_FAILED, { label, error: snap.persistenceError });
+    }
+    this._emit(PerceptionEvent.SNAPSHOT_CREATED, { label, entities: snap.entityIds.length, relationships: snap.relationshipIds.length, persisted: snap.id !== null });
     return snap;
   }
 
@@ -234,9 +248,11 @@ export class PerceptionEngine {
   // snapshots taken around its execution.
   async recordActionEffect(actionId, before, after) {
     const delta = this.diff(before, after);
-    try {
-      await this.semanticState.recordActionEffects(actionId, [...delta.addedEntities, ...delta.changedEntities], delta.addedRelationships);
-    } catch { /* best-effort persistence */ }
+    // Persist through the single-writer token. A failure here is NOT swallowed:
+    // it is surfaced as an ACTION_EFFECT_FAILED event (audited by the runtime)
+    // and re-thrown so the caller can record an observable failure. Semantic
+    // persistence must never fail silently.
+    await this._persistActionEffects(actionId, [...delta.addedEntities, ...delta.changedEntities], delta.addedRelationships);
     this._emit(PerceptionEvent.ACTION_EFFECT_RECORDED, { actionId, delta });
     return delta;
   }
@@ -244,14 +260,29 @@ export class PerceptionEngine {
   // Record the explicit entity/relationship ids that an action produced. Used
   // when the effect is already known from an observation ingest (no diff needed).
   async recordEffects(actionId, entityIds = [], relationshipIds = []) {
-    try {
-      await this.semanticState.recordActionEffects(actionId, entityIds, relationshipIds);
-    } catch { /* best-effort persistence */ }
+    await this._persistActionEffects(actionId, entityIds, relationshipIds);
     this._emit(PerceptionEvent.ACTION_EFFECT_RECORDED, {
       actionId,
       delta: { addedEntities: entityIds, changedEntities: [], addedRelationships: relationshipIds }
     });
     return { actionId, entityIds, relationshipIds };
+  }
+
+  // Single choke point for action-effect persistence. Forwards the writer token
+  // (required by SemanticState's single-writer guard) and turns any failure into
+  // an observable event + thrown error instead of a silent drop.
+  async _persistActionEffects(actionId, entityIds, relationshipIds) {
+    try {
+      await this.semanticState.recordActionEffects(actionId, entityIds, relationshipIds, this._writerToken);
+    } catch (error) {
+      this._emit(PerceptionEvent.ACTION_EFFECT_FAILED, {
+        actionId,
+        entityIds,
+        relationshipIds,
+        error: error instanceof Error ? error.message : String(error)
+      });
+      throw error;
+    }
   }
 
   _fingerprint(entity) {

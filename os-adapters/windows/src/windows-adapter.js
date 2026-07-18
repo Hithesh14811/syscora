@@ -37,13 +37,30 @@ export class WindowsAdapter {
         shell: false
       });
       const timeoutMs = options.timeoutMs ?? 15000;
+      const signal = options.signal ?? null;
       let stdout = "";
       let stderr = "";
       let timedOut = false;
+      let cancelled = false;
       const timeout = setTimeout(() => {
         timedOut = true;
         child.kill();
       }, timeoutMs);
+      // Cooperative cancellation: an aborted signal kills the child promptly and
+      // the result carries `cancelled: true` so callers can distinguish it from a
+      // timeout or a normal non-zero exit.
+      const onAbort = () => {
+        cancelled = true;
+        child.kill();
+      };
+      if (signal) {
+        if (signal.aborted) onAbort();
+        else signal.addEventListener("abort", onAbort, { once: true });
+      }
+      const cleanup = () => {
+        clearTimeout(timeout);
+        if (signal) signal.removeEventListener?.("abort", onAbort);
+      };
       child.stdout.on("data", (chunk) => {
         stdout += chunk.toString();
       });
@@ -51,23 +68,25 @@ export class WindowsAdapter {
         stderr += chunk.toString();
       });
       child.on("close", (code) => {
-        clearTimeout(timeout);
+        cleanup();
         resolve({
           command,
           args,
           exitCode: code ?? -1,
           timedOut,
+          cancelled,
           stdout,
           stderr
         });
       });
       child.on("error", (error) => {
-        clearTimeout(timeout);
+        cleanup();
         resolve({
           command,
           args,
           exitCode: -1,
-          timedOut: false,
+          timedOut,
+          cancelled,
           stdout,
           stderr: `${stderr}\n${error.message}`.trim()
         });
@@ -82,6 +101,17 @@ export class WindowsAdapter {
       ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
       options
     );
+  }
+
+  // Inspect a service and report whether it exists (used by the privileged
+  // helper to validate a target before attempting a bounded restart).
+  async serviceExists(serviceName) {
+    const escaped = escapePowerShellSingleQuoted(serviceName);
+    const ps = await this.runPowerShell(
+      `if (Get-Service -Name '${escaped}' -ErrorAction SilentlyContinue) { 'true' } else { 'false' }`,
+      { timeoutMs: 6000 }
+    );
+    return { exists: (ps.stdout ?? "").trim() === "true", commandResult: ps };
   }
 
   async getSystemInformation() {
@@ -474,9 +504,12 @@ export class WindowsAdapter {
     const root = rootDirectory ?? this.getDownloadsPath();
     const escapedRoot = escapePowerShellSingleQuoted(root);
     const escapedPattern = escapePowerShellSingleQuoted(pattern);
+    // maxResults is interpolated unquoted into the script, so it must be a
+    // bounded integer literal — never caller text. Coerce and clamp.
+    const limit = Math.min(1000, Math.max(1, Math.trunc(Number(maxResults)) || 50));
     const ps = await this.runPowerShell(
       `Get-ChildItem -Path '${escapedRoot}' -Recurse -Filter '${escapedPattern}' -ErrorAction SilentlyContinue | ` +
-      `Select-Object -First ${maxResults} FullName,Length,LastWriteTime | ConvertTo-Json -Compress`,
+      `Select-Object -First ${limit} FullName,Length,LastWriteTime | ConvertTo-Json -Compress`,
       { timeoutMs: 30000 }
     );
     let parsed = [];
@@ -522,6 +555,15 @@ export class WindowsAdapter {
     const target = path.resolve(filePath);
     const contents = await fs.readFile(target, "utf8");
     return { filePath: target, contents };
+  }
+
+  async removeTextFile(filePath) {
+    try {
+      await fs.unlink(path.resolve(filePath));
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+    return { filePath: path.resolve(filePath), removed: true };
   }
 
   async verifyFileContains(filePath, expectedSubstring) {

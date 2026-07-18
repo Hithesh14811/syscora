@@ -1,5 +1,25 @@
 import { RiskLevel } from "../../shared-types/src/domain.js";
 import crypto from "crypto";
+import {
+  CAPABILITY_CONTRACT_VERSION,
+  CapabilityHealth,
+  isCapabilityHealthy,
+  normalizeCapability,
+  satisfiesVersion,
+  validateCapabilityContract
+} from "./contract.js";
+export {
+  PermissionScope,
+  PermissionType,
+  ApprovalReusePolicy,
+  DEFAULT_WRITE_GRANT_TTL_MS,
+  DEFAULT_READ_GRANT_TTL_MS
+} from "./contract.js";
+import { CapabilityLifecyclePipeline } from "./pipeline.js";
+export { CapabilityPluginLoader, MANIFEST_FILE } from "./plugin-loader.js";
+export { createPluginSignatureVerifier, loadTrustedKeys } from "./signature.js";
+export { createCapabilityTemplate } from "./template.js";
+export { validateCapabilityPackage, validatePluginCapabilityDefinition, validatePluginManifest } from "./quality.js";
 const createId = () => crypto.randomBytes(16).toString("hex");
 
 export const LifecycleStatus = {
@@ -10,16 +30,39 @@ export const LifecycleStatus = {
 };
 
 export class CapabilityRegistry {
-  constructor(capabilities = []) {
-    this.capabilities = new Map(capabilities.map((capability) => [capability.name, capability]));
+  constructor(capabilities = [], { runtimeVersion, onEvent } = {}) {
+    this.capabilities = new Map();
+    this.runtimeVersion = runtimeVersion ?? "0.1.0";
+    this.listeners = new Set();
+    if (onEvent) this.listeners.add(onEvent);
+    this.pipeline = new CapabilityLifecyclePipeline({ registry: this, onEvent: (event) => this.emit(event.type, event) });
+    for (const capability of capabilities) this.register(capability);
   }
 
-  register(capability) {
-    // Default to UNAVAILABLE if no status provided
-    if (!capability.lifecycleStatus) {
-      capability.lifecycleStatus = LifecycleStatus.UNAVAILABLE;
+  onEvent(listener) {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  emit(type, payload = {}) {
+    const event = { type, timestamp: new Date().toISOString(), ...payload };
+    for (const listener of this.listeners) {
+      try { listener(event); } catch { /* observability listeners must not affect execution */ }
     }
-    this.capabilities.set(capability.name, capability);
+    return event;
+  }
+
+  register(capability, options = {}) {
+    const normalized = normalizeCapability(capability, options);
+    const validation = validateCapabilityContract(normalized, { strict: options.strict === true });
+    if (!validation.valid) throw new Error(`Invalid capability ${normalized.name ?? "unknown"}: ${validation.errors.join("; ")}`);
+    if (!satisfiesVersion(this.runtimeVersion, normalized.packaging.runtimeVersion)) {
+      throw new Error(`Capability ${normalized.name} requires runtime ${normalized.packaging.runtimeVersion}`);
+    }
+    if (this.capabilities.has(normalized.name)) throw new Error(`Duplicate capability registration: ${normalized.name}`);
+    this.capabilities.set(normalized.name, normalized);
+    this.emit("CAPABILITY_REGISTERED", { capability: normalized.name, source: normalized.packaging.source, version: normalized.version });
+    return normalized;
   }
 
   get(name) {
@@ -34,28 +77,92 @@ export class CapabilityRegistry {
     return [...this.capabilities.values()];
   }
 
-  getAvailable() {
-    return this.list().filter(
-      (cap) => cap.lifecycleStatus === LifecycleStatus.IMPLEMENTED || cap.lifecycleStatus === LifecycleStatus.VERIFIED
-    );
+  unregister(name, { source } = {}) {
+    const capability = this.get(name);
+    if (!capability) return false;
+    if (source && capability.packaging.source !== source) throw new Error(`Capability ${name} is not owned by ${source}`);
+    this.capabilities.delete(name);
+    this.emit("CAPABILITY_REMOVED", { capability: name, source: capability.packaging.source });
+    return true;
   }
 
-  getCatalog() {
-    return this.getAvailable().map(cap => ({
+  setHealth(name, status) {
+    const capability = this.get(name);
+    if (!capability) throw new Error(`Unknown capability ${name}`);
+    capability.health.status = status;
+    this.emit(status === CapabilityHealth.DISABLED ? "CAPABILITY_DISABLED" : "CAPABILITY_HEALTH_CHANGED", { capability: name, status });
+    return capability;
+  }
+
+  getAvailable(context = {}) {
+    return this.list().filter((capability) => this.isAvailable(capability.name, context));
+  }
+
+  isAvailable(name, context = {}, visited = new Set()) {
+    const capability = this.get(name);
+    if (!capability || visited.has(name) || !isCapabilityHealthy(capability, context)) return false;
+    if (context.platform && !capability.requirements.operatingSystems.includes(context.platform)) return false;
+    const stack = new Set(visited).add(name);
+    return capability.requirements.capabilities.every((requirement) => {
+      const dependency = typeof requirement === "string" ? { capability: requirement } : requirement;
+      const found = this.get(dependency.capability);
+      return Boolean(found) && satisfiesVersion(found.version, dependency.version ?? "*") && this.isAvailable(found.name, context, stack);
+    });
+  }
+
+  resolveDependencies(name, context = {}) {
+    const ordered = [];
+    const visiting = new Set();
+    const visit = (capabilityName) => {
+      if (visiting.has(capabilityName)) throw new Error(`Capability dependency cycle: ${capabilityName}`);
+      const capability = this.get(capabilityName);
+      if (!capability || !this.isAvailable(capabilityName, context)) throw new Error(`Unavailable capability dependency: ${capabilityName}`);
+      visiting.add(capabilityName);
+      for (const requirement of capability.requirements.capabilities) visit(typeof requirement === "string" ? requirement : requirement.capability);
+      visiting.delete(capabilityName);
+      if (!ordered.includes(capabilityName)) ordered.push(capabilityName);
+    };
+    visit(name);
+    return ordered;
+  }
+
+  getCatalog(context = {}) {
+    return this.getAvailable(context).map(cap => ({
       name: cap.name,
+      capabilityId: cap.capabilityId,
+      contractVersion: cap.contractVersion,
       version: cap.version,
+      category: cap.category,
       description: cap.description,
+      owner: cap.owner,
       inputSchema: cap.inputSchema,
-      riskProfile: cap.riskProfile,
-      permissions: cap.permissions,
+      outputSchema: cap.outputSchema,
+      risk: cap.risk,
+      requirements: cap.requirements,
+      security: cap.security,
       reversibility: cap.reversibility,
-      lifecycleStatus: cap.lifecycleStatus
+      rollbackSupport: cap.rollbackSupport,
+      lifecycle: cap.lifecycle,
+      lifecycleStatus: cap.lifecycleStatus,
+      health: cap.health,
+      documentation: cap.documentation,
+      deprecation: cap.deprecation,
+      packaging: cap.packaging
     }));
   }
 }
 
-export function createDefaultCapabilityRegistry(adapter) {
+export { CAPABILITY_CONTRACT_VERSION, CapabilityHealth, CapabilityLifecyclePipeline, validateCapabilityContract };
+
+export function createDefaultCapabilityRegistry(adapter, options = {}) {
   const registry = new CapabilityRegistry();
+  // Optional privileged-operation boundary. When provided (production wiring),
+  // the privileged capabilities below become executable through the canonical
+  // runtime: each consumes a single-use approval token and dispatches to the
+  // bounded, allow-listed helper — never a shell. When absent (lightweight/test
+  // wiring), the privileged capabilities are still registered but marked
+  // UNAVAILABLE so the planner/validator will not select them.
+  const privilegedHelper = options.privilegedHelper ?? null;
 
   // system.inspect
   registry.register({
@@ -314,8 +421,10 @@ export function createDefaultCapabilityRegistry(adapter) {
       };
     },
     rollback: async (args, checkpoint) => {
-      return adapter.rollbackProjectEnvironmentVariable(args.workspacePath, checkpoint);
+      if (checkpoint.exists) return adapter.writeTextFile(checkpoint.filePath, checkpoint.rawContents);
+      return adapter.removeTextFile(checkpoint.filePath);
     },
+    createCheckpoint: async (args) => adapter.inspectProjectEnvironment(args.workspacePath),
     timeout: 10000,
     retryPolicy: { maxAttempts: 1, backoffMs: 1000 },
     lifecycleStatus: LifecycleStatus.VERIFIED
@@ -361,8 +470,9 @@ export function createDefaultCapabilityRegistry(adapter) {
       };
     },
     rollback: async (args, checkpoint) => {
-      return adapter.rollbackUserPath(checkpoint);
+      return adapter.rollbackUserPath(checkpoint.value ?? "");
     },
+    createCheckpoint: async () => adapter.getUserPath(),
     timeout: 15000,
     retryPolicy: { maxAttempts: 1, backoffMs: 1000 },
     lifecycleStatus: LifecycleStatus.VERIFIED
@@ -534,17 +644,25 @@ export function createDefaultCapabilityRegistry(adapter) {
       };
     },
     rollback: async (args, checkpoint) => {
-      if (checkpoint?.previousContents !== null) {
-        return adapter.writeTextFile(args.filePath, checkpoint.previousContents);
+      if (checkpoint?.exists) return adapter.writeTextFile(args.filePath, checkpoint.contents);
+      return adapter.removeTextFile(args.filePath);
+    },
+    createCheckpoint: async (args) => {
+      try {
+        const file = await adapter.readTextFile(args.filePath);
+        return { exists: true, contents: file.contents };
+      } catch (error) {
+        if (error?.code === "ENOENT") return { exists: false, contents: null };
+        throw error;
       }
-      return { success: true };
     },
     timeout: 10000,
     retryPolicy: { maxAttempts: 1, backoffMs: 1000 },
     lifecycleStatus: LifecycleStatus.VERIFIED
   });
 
-  // Add compatibility capabilities for existing tests (stubs, marked UNAVAILABLE)
+  /* Removed compatibility registrations. Kept as a non-executable migration
+   * record until the next source compaction; they cannot enter discovery.
   registry.register({
     name: "developer.project.detect",
     version: "1.0.0",
@@ -825,11 +943,9 @@ export function createDefaultCapabilityRegistry(adapter) {
     lifecycleStatus: LifecycleStatus.UNAVAILABLE
   });
 
-  // ============================================================================
-  // Real capabilities that wrap already-working adapter operations. These are
-  // registered last so they overwrite the reserved UNAVAILABLE stubs above.
-  // Only operations backed by a working adapter method are exposed.
-  // ============================================================================
+  */
+
+  // Adapter-backed capabilities with one canonical registration each.
 
   // environment.user.set (real) - set a Windows user environment variable
   registry.register({
@@ -877,6 +993,10 @@ export function createDefaultCapabilityRegistry(adapter) {
     rollback: async (args, checkpoint) => {
       return adapter.restoreUserEnvironmentVariable(args.key, checkpoint?.previousValue ?? null);
     },
+    createCheckpoint: async (args) => {
+      const existing = await adapter.inspectUserEnvironmentVariable(args.key);
+      return { previousValue: existing.value ?? null };
+    },
     timeout: 15000,
     retryPolicy: { maxAttempts: 1, backoffMs: 1000 },
     lifecycleStatus: LifecycleStatus.VERIFIED
@@ -918,6 +1038,10 @@ export function createDefaultCapabilityRegistry(adapter) {
     },
     rollback: async (args, checkpoint) => {
       return adapter.rollbackUserPath(checkpoint?.previousValue ?? "");
+    },
+    createCheckpoint: async () => {
+      const current = await adapter.getUserPath();
+      return { previousValue: current.value ?? "" };
     },
     timeout: 15000,
     retryPolicy: { maxAttempts: 1, backoffMs: 1000 },
@@ -1303,6 +1427,138 @@ export function createDefaultCapabilityRegistry(adapter) {
     timeout: 15000,
     retryPolicy: { maxAttempts: 1, backoffMs: 1000 },
     lifecycleStatus: LifecycleStatus.VERIFIED
+  });
+
+  // Privileged capabilities (canonical convergence). These are the ONLY way a
+  // bounded privileged operation reaches execution: they flow through the same
+  // planner -> risk -> policy -> permission-broker -> scheduler -> pipeline path
+  // as every other capability. There is no separate privileged execution route.
+  //
+  // Each capability:
+  //   - declares MEDIUM risk, so policy routes it through CONFIRM (HIGH/CRITICAL
+  //     is hard-denied by the PolicyEngine), and the derived permission model is
+  //     EXECUTE + SINGLE_USE (elevation), enforced by the capability grant store;
+  //   - requires an approval token (task input `token`) which its execute()
+  //     consumes through the PrivilegedOperationHelper — the token is validated
+  //     and single-use inside the broker, so an approved grant alone is not
+  //     sufficient to mutate;
+  //   - defaults to the read-only VALIDATE mode; COMMIT must be requested
+  //     explicitly (task input `mode: "COMMIT"`), matching the helper contract.
+  //
+  // When no privilegedHelper is wired (lightweight/test runtime), they register
+  // as UNAVAILABLE so the planner/validator will not select them, keeping the
+  // default in-memory registry free of an executable privileged surface.
+  const privilegedLifecycle = privilegedHelper
+    ? LifecycleStatus.VERIFIED
+    : LifecycleStatus.UNAVAILABLE;
+
+  const runPrivileged = async (operation, scope, args) => {
+    if (!privilegedHelper) {
+      return { success: false, operation, scope, reason: "Privileged helper is not configured for this runtime." };
+    }
+    return privilegedHelper.execute(operation, scope, {
+      sessionId: args?.sessionId,
+      token: args?.token,
+      mode: args?.mode === "COMMIT" ? "COMMIT" : "VALIDATE"
+    });
+  };
+
+  // service.restart (privileged) - restart a Windows service through the bounded,
+  // token-gated helper.
+  registry.register({
+    name: "service.restart",
+    version: "1.0.0",
+    description: "Restart a Windows service through the bounded privileged helper",
+    inputSchema: {
+      type: "object",
+      properties: {
+        scope: { type: "string" },
+        token: { type: "string" },
+        mode: { type: "string", enum: ["VALIDATE", "COMMIT"] },
+        sessionId: { type: "string" }
+      },
+      required: ["scope", "token"]
+    },
+    outputSchema: { type: "object" },
+    requiredContext: [],
+    riskMetadata: { level: RiskLevel.MEDIUM },
+    permissions: ["system:service:restart"],
+    requirements: { elevation: "ADMIN", permissions: ["system:service:restart"] },
+    reversibility: "NOT_REQUIRED",
+    preconditions: (args) => typeof args?.scope === "string" && args.scope.trim() !== "" && typeof args?.token === "string" && args.token !== "",
+    execute: async (args) => runPrivileged("service.restart", args.scope, args),
+    observe: async (result, args) => ({
+      observationId: createId(),
+      source: "service.restart",
+      timestamp: new Date().toISOString(),
+      structuredState: result,
+      relatedActionId: args?.actionId,
+      detectedChanges: ["system.service"],
+      confidence: result?.success ? 0.9 : 0,
+      trustLevel: "SYSTEM_TRUSTED"
+    }),
+    verify: async (observation) => {
+      const result = observation?.structuredState ?? {};
+      return {
+        status: result.success ? "VERIFIED" : "FAILED",
+        message: result.reason ?? (result.success ? "Privileged service.restart completed" : "Privileged service.restart failed"),
+        evidence: result,
+        confidence: result.success ? 0.9 : 0
+      };
+    },
+    rollback: null,
+    timeout: 30000,
+    retryPolicy: { maxAttempts: 1 },
+    lifecycleStatus: privilegedLifecycle
+  });
+
+  // package.install (privileged) - install a package through the bounded,
+  // token-gated helper.
+  registry.register({
+    name: "package.install",
+    version: "1.0.0",
+    description: "Install a package through the bounded privileged helper",
+    inputSchema: {
+      type: "object",
+      properties: {
+        scope: { type: "string" },
+        token: { type: "string" },
+        mode: { type: "string", enum: ["VALIDATE", "COMMIT"] },
+        sessionId: { type: "string" }
+      },
+      required: ["scope", "token"]
+    },
+    outputSchema: { type: "object" },
+    requiredContext: [],
+    riskMetadata: { level: RiskLevel.MEDIUM },
+    permissions: ["system:package:install"],
+    requirements: { elevation: "ADMIN", permissions: ["system:package:install"] },
+    reversibility: "NOT_REQUIRED",
+    preconditions: (args) => typeof args?.scope === "string" && args.scope.trim() !== "" && typeof args?.token === "string" && args.token !== "",
+    execute: async (args) => runPrivileged("package.install", args.scope, args),
+    observe: async (result, args) => ({
+      observationId: createId(),
+      source: "package.install",
+      timestamp: new Date().toISOString(),
+      structuredState: result,
+      relatedActionId: args?.actionId,
+      detectedChanges: ["system.packages"],
+      confidence: result?.success ? 0.9 : 0,
+      trustLevel: "SYSTEM_TRUSTED"
+    }),
+    verify: async (observation) => {
+      const result = observation?.structuredState ?? {};
+      return {
+        status: result.success ? "VERIFIED" : "FAILED",
+        message: result.reason ?? (result.success ? "Privileged package.install completed" : "Privileged package.install failed"),
+        evidence: result,
+        confidence: result.success ? 0.9 : 0
+      };
+    },
+    rollback: null,
+    timeout: 600000,
+    retryPolicy: { maxAttempts: 1 },
+    lifecycleStatus: privilegedLifecycle
   });
 
   return registry;

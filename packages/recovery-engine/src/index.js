@@ -25,17 +25,23 @@ const CATEGORY_TO_ACTION = {
   UNEXPECTED: "replan"
 };
 
+export const DEFAULT_RECOVERY_BUDGET = 6;
+
+export function createRecoveryBudget(budget = {}) {
+  return {
+    total: Math.max(0, Number(budget.total ?? DEFAULT_RECOVERY_BUDGET)),
+    spent: Math.max(0, Number(budget.spent ?? budget.used ?? 0)),
+    attempts: Array.isArray(budget.attempts) ? [...budget.attempts] : []
+  };
+}
+
 export class RecoveryEngine {
   // Decide the next recovery action.
   //   input: { diagnosis, budget: { total, spent, attempts }, replanAttempts, maxReplanAttempts }
   //   returns: { action, reason, budget }
   // The budget is always returned (updated) so the caller can persist it.
   recover({ diagnosis, budget, replanAttempts = 0, maxReplanAttempts = 2 } = {}) {
-    const currentBudget = {
-      total: Number(budget?.total ?? 6),
-      spent: Number(budget?.spent ?? 0),
-      attempts: Array.isArray(budget?.attempts) ? [...budget.attempts] : []
-    };
+    const currentBudget = createRecoveryBudget(budget);
     const category = diagnosis?.category ?? diagnosis?.failureClass ?? "UNEXPECTED";
     const remaining = currentBudget.total - currentBudget.spent;
 

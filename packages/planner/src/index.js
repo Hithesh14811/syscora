@@ -2,6 +2,12 @@ import crypto from "crypto";
 const createId = () => crypto.randomBytes(16).toString("hex");
 import { validateSchema } from "../../model-providers/src/index.js";
 
+export const TASK_LIMITS = Object.freeze({
+  minTimeoutMs: 1000,
+  maxTimeoutMs: 600000,
+  maxRetryBudget: 10
+});
+
 // Build a canonical scheduler task. Centralizes the task shape so every planner
 // path (operation-driven and keyword-driven) produces identical structure.
 export function buildTask(capability, inputs = {}, overrides = {}) {
@@ -17,9 +23,10 @@ export function buildTask(capability, inputs = {}, overrides = {}) {
     riskHints: overrides.riskHints ?? "LOW",
     verificationCriteria: overrides.verificationCriteria ?? [`${capability} verified`],
     completionCriteria: overrides.completionCriteria ?? [`${capability} completed`],
-    timeout: overrides.timeout ?? 15000,
+    timeout: Math.min(Math.max(overrides.timeout ?? 15000, TASK_LIMITS.minTimeoutMs), TASK_LIMITS.maxTimeoutMs),
     retryBudget: overrides.retryBudget ?? 1,
-    idempotency: overrides.idempotency ?? true
+    idempotency: overrides.idempotency ?? true,
+    rollbackRequired: overrides.rollbackRequired ?? false
   };
 }
 
@@ -143,6 +150,41 @@ export const OPERATION_PLANS = {
       timeout: 20000
     })
   ],
+  // Privileged operations. The scope (service name / package id), the single-use
+  // approval token, and the execution mode are threaded from structured entities
+  // into the capability inputs. The capability's execute() consumes the token
+  // through the bounded helper; VALIDATE (read-only) is the default so an approved
+  // token alone never mutates unless mode COMMIT is explicitly requested.
+  "service.restart": (e) => [
+    buildTask("service.restart", {
+      scope: e.scope,
+      token: e.token,
+      mode: e.mode === "COMMIT" ? "COMMIT" : "VALIDATE",
+      sessionId: e.sessionId
+    }, {
+      goal: "Restart service",
+      description: "Restart a Windows service through the bounded privileged helper",
+      riskHints: "MEDIUM",
+      expectedStateChanges: ["system.service"],
+      completionCriteria: ["Privileged service.restart completed"],
+      timeout: 30000
+    })
+  ],
+  "package.install": (e) => [
+    buildTask("package.install", {
+      scope: e.scope,
+      token: e.token,
+      mode: e.mode === "COMMIT" ? "COMMIT" : "VALIDATE",
+      sessionId: e.sessionId
+    }, {
+      goal: "Install package",
+      description: "Install a package through the bounded privileged helper",
+      riskHints: "MEDIUM",
+      expectedStateChanges: ["system.packages"],
+      completionCriteria: ["Privileged package.install completed"],
+      timeout: 600000
+    })
+  ],
   "application.notepad.launch": (e) => [
     buildTask("application.notepad.launch", { content: e.content, filename: e.filename }, {
       goal: "Notepad task",
@@ -202,6 +244,7 @@ export class PlanValidator {
 
     // Validate each task
     for (const task of taskGraph.tasks) {
+      let cap = null;
       if (!task.taskId) {
         errors.push("Task must have an ID");
         continue;
@@ -216,15 +259,21 @@ export class PlanValidator {
       } else if (!this.capabilityRegistry.has(task.capability)) {
         errors.push(`Unknown capability ${task.capability} for task ${task.taskId}`);
       } else {
-        const cap = this.capabilityRegistry.get(task.capability);
+        cap = this.capabilityRegistry.get(task.capability);
+        if (!this.capabilityRegistry.isAvailable(task.capability, { platform: process.platform })) {
+          errors.push(`Capability ${task.capability} is unavailable or unhealthy for task ${task.taskId}`);
+        }
         const inputValidation = validateSchema(task.inputs, cap.inputSchema);
         if (!inputValidation.valid) {
           errors.push(`Invalid inputs for task ${task.taskId}: ${inputValidation.errors.join(", ")}`);
         }
 
         // Check if mutating, but has verification criteria
-        if (cap.mutates && (!task.verificationCriteria || task.verificationCriteria.length === 0)) {
+        if (cap.reversibility !== "NOT_REQUIRED" && (!task.verificationCriteria || task.verificationCriteria.length === 0)) {
           errors.push(`Task ${task.taskId} has a mutating capability but no verification criteria`);
+        }
+        if (cap.reversibility === "ROLLBACK_SUPPORTED" && task.rollbackRequired !== true) {
+          errors.push(`Task ${task.taskId} must explicitly require rollback support`);
         }
       }
 
@@ -235,10 +284,12 @@ export class PlanValidator {
       }
 
       // Check retry budget and timeout
-      if (task.retryBudget === undefined || task.retryBudget < 0 || task.retryBudget > 10) {
+      const capabilityRetryBudget = Math.max(0, Number(cap?.retryPolicy?.maxAttempts ?? 1) - 1);
+      if (task.retryBudget === undefined || task.retryBudget < 0 || task.retryBudget > Math.min(TASK_LIMITS.maxRetryBudget, capabilityRetryBudget)) {
         errors.push(`Task ${task.taskId} has invalid retry budget`);
       }
-      if (task.timeout === undefined || task.timeout < 1000 || task.timeout > 300000) {
+      const capabilityTimeout = Number(cap?.timeout ?? TASK_LIMITS.maxTimeoutMs);
+      if (task.timeout === undefined || task.timeout < TASK_LIMITS.minTimeoutMs || task.timeout > Math.min(TASK_LIMITS.maxTimeoutMs, capabilityTimeout)) {
         errors.push(`Task ${task.taskId} has invalid timeout`);
       }
     }
@@ -268,8 +319,19 @@ export class PlanValidator {
 }
 
 export class GeneralPlanner {
-  constructor(modelProvider, capabilityRegistry) {
-    this.modelProvider = modelProvider;
+  // Accepts either a ReasoningEngine (preferred — the single model boundary) or,
+  // for backward compatibility, a raw model provider. When a ReasoningEngine is
+  // supplied the planner asks it to compose a task graph; otherwise it uses the
+  // deterministic fallback. Either way the output is treated as a proposal and
+  // must pass PlanValidator before execution.
+  constructor(reasoningOrModel, capabilityRegistry) {
+    if (reasoningOrModel && typeof reasoningOrModel.composeTaskGraph === "function") {
+      this.reasoningEngine = reasoningOrModel;
+      this.modelProvider = null;
+    } else {
+      this.reasoningEngine = null;
+      this.modelProvider = reasoningOrModel || null;
+    }
     this.capabilityRegistry = capabilityRegistry;
   }
 
@@ -280,80 +342,36 @@ export class GeneralPlanner {
     relevantMemory = [], 
     previousExecutionState = null
   ) {
-    const catalog = this.capabilityRegistry.getCatalog();
     let plan = null;
 
-    // Use model to generate plan if available, else use deterministic fallback
-    if (this.modelProvider) {
-      try {
-        const prompt = `
-          Generate a task plan for this intent using ONLY the registered capabilities.
-          
-          Intent: ${JSON.stringify(userIntent)}
-          Capabilities: ${JSON.stringify(catalog)}
-          Context: ${JSON.stringify(resolvedContext.map(c => ({ type: c.type, data: c.data })))}
-          Semantic State: ${JSON.stringify(relevantSemanticState)}
-          Memory: ${JSON.stringify(relevantMemory)}
-          
-          Return JSON:
-          {
-            "planId": "string",
-            "planVersion": 1,
-            "parentPlanId": null,
-            "goal": "string",
-            "finalSuccessCriteria": ["string"],
-            "summary": "string",
-            "taskGraph": {
-              "graphId": "string",
-              "tasks": [
-                {
-                  "taskId": "string",
-                  "goal": "string",
-                  "description": "string",
-                  "dependencies": ["taskId"],
-                  "capability": "capability.name",
-                  "inputs": {},
-                  "expectedStateChanges": [],
-                  "affectedEntities": [],
-                  "riskHints": "LOW/MEDIUM/HIGH",
-                  "verificationCriteria": [],
-                  "completionCriteria": [],
-                  "timeout": 30000,
-                  "retryBudget": 1,
-                  "idempotency": "true/false"
-                }
-              ]
-            }
-          }
-        `.trim();
-        plan = await this.modelProvider.generateStructured(
-          prompt,
-          {
-            type: "object",
-            required: ["planId", "goal", "taskGraph", "finalSuccessCriteria"],
-            properties: {
-              planId: { type: "string" },
-              planVersion: { type: "number" },
-              parentPlanId: { type: ["string", "null"] },
-              goal: { type: "string" },
-              finalSuccessCriteria: { type: "array", items: { type: "string" } },
-              summary: { type: "string" },
-              taskGraph: { type: "object" }
-            }
-          },
-          { validateSchema: true, timeoutMs: 45000 }
-        );
-      } catch (e) {
-        console.warn("Model-based planning failed, using fallback:", e);
+    // LLM planning goes through the ReasoningEngine, which validates output,
+    // performs bounded repair, and rejects hallucinated capabilities. It returns
+    // { ok, data } and NEVER throws — so any failure (no model, bad JSON,
+    // timeout, hallucination) falls through to the deterministic planner below.
+    if (this.reasoningEngine && this.reasoningEngine.hasModel()) {
+      const result = await this.reasoningEngine.composeTaskGraph(userIntent, {
+        context: resolvedContext,
+        semanticState: relevantSemanticState,
+        memory: relevantMemory,
+        previousExecutionState
+      });
+      if (result.ok && this._isStructurallyPlan(result.data)) {
+        plan = result.data;
       }
     }
 
-    // Only accept a model-produced plan if it is structurally a plan (has a
-    // task graph with a tasks array). Providers such as MockModelProvider may
-    // return an object that does not match the plan schema; in that case we
-    // fall back to deterministic planning rather than trusting bad output.
+    // Deterministic fallback: the production planner when no model is configured
+    // or the model output was rejected. The runtime always has a valid plan.
     if (!this._isStructurallyPlan(plan)) {
       plan = this.fallbackPlan(userIntent, resolvedContext);
+    }
+
+    // An LLM plan is a proposal only. Normalize it against the capability
+    // contract and fall back deterministically if it still cannot validate.
+    plan = this._mergeCompletedTasks(plan, previousExecutionState);
+    plan = this._normalizePlan(plan);
+    if (!new PlanValidator(this.capabilityRegistry).validatePlan(plan.taskGraph).valid) {
+      plan = this._normalizePlan(this.fallbackPlan(userIntent, resolvedContext));
     }
 
     // Ensure all required fields exist
@@ -362,6 +380,44 @@ export class GeneralPlanner {
     plan.parentPlanId = plan.parentPlanId ?? null;
     plan.finalSuccessCriteria = plan.finalSuccessCriteria ?? ["Task completed"];
     plan.taskGraph.graphId = plan.taskGraph.graphId ?? createId();
+    return plan;
+  }
+
+  _normalizePlan(plan) {
+    if (!this._isStructurallyPlan(plan)) return plan;
+    for (const task of plan.taskGraph.tasks) {
+      const capability = this.capabilityRegistry?.get(task.capability);
+      if (!capability) continue;
+      task.dependencies = Array.isArray(task.dependencies) ? task.dependencies : [];
+      task.inputs = task.inputs && typeof task.inputs === "object" ? task.inputs : {};
+      task.verificationCriteria = Array.isArray(task.verificationCriteria) && task.verificationCriteria.length
+        ? task.verificationCriteria
+        : [`${task.capability} verified`];
+      task.completionCriteria = Array.isArray(task.completionCriteria) && task.completionCriteria.length
+        ? task.completionCriteria
+        : [`${task.capability} completed`];
+      task.timeout = Math.min(
+        Math.max(Number(task.timeout ?? capability.timeout ?? 15000), TASK_LIMITS.minTimeoutMs),
+        TASK_LIMITS.maxTimeoutMs,
+        Number(capability.timeout ?? TASK_LIMITS.maxTimeoutMs)
+      );
+      task.retryBudget = Math.min(
+        Math.max(0, Number(task.retryBudget ?? 0)),
+        TASK_LIMITS.maxRetryBudget,
+        Math.max(0, Number(capability.retryPolicy?.maxAttempts ?? 1) - 1)
+      );
+      task.rollbackRequired = capability.reversibility === "ROLLBACK_SUPPORTED";
+    }
+    return plan;
+  }
+
+  _mergeCompletedTasks(plan, previousExecutionState) {
+    const originalTasks = previousExecutionState?.originalPlan?.taskGraph?.tasks;
+    const completedTaskIds = new Set(previousExecutionState?.completedTaskIds ?? []);
+    if (!Array.isArray(originalTasks) || completedTaskIds.size === 0 || !this._isStructurallyPlan(plan)) return plan;
+    const existing = new Set(plan.taskGraph.tasks.map((task) => task.taskId));
+    const preserved = originalTasks.filter((task) => completedTaskIds.has(task.taskId) && !existing.has(task.taskId));
+    plan.taskGraph.tasks = [...preserved, ...plan.taskGraph.tasks];
     return plan;
   }
 

@@ -1,49 +1,35 @@
 # MVP Architecture
 
-The current MVP implements the first trustworthy closed-loop workflow for SYSCORA:
+SYSCORA executes requests through one canonical runtime path:
 
-1. accept a natural-language intent for a workspace environment variable
-2. collect workspace-local context
-3. create a typed plan bound to a registered capability
-4. assess risk
-5. apply deterministic policy
-6. request explicit approval
-7. checkpoint current state
-8. execute a typed action through an adapter
-9. verify the observed result
-10. update semantic state and memory metadata
-11. persist the session and append audit events
-12. support rollback on failure
+1. classify intent and collect requested context
+2. populate the semantic world model through Perception and retrieve relevant memory
+3. generate a capability-bound TaskGraph and validate it against the registry
+4. assess risk, apply policy, and obtain approval where required
+5. execute tasks through the TaskGraphScheduler, then observe and verify each result
+6. diagnose failures within a normalized recovery budget, replan when safe, or roll back
+7. finalize the goal, snapshot semantic state, update memory, and persist redacted session/audit records
 
 ## Current Subsystems
 
-- `apps/cli`: thin local client for intent submission and approval
-- `apps/daemon`: runtime composition root and inspection entrypoint
-- `packages/shared-types`: IDs, enums, validators, audit event factory
-- `packages/protocol`: versioned response contract
-- `packages/capability-registry`: authoritative capability catalogue
-- `packages/risk-engine`: deterministic risk classification for the vertical slice
-- `packages/policy-engine`: deterministic allow/confirm/deny decisions
-- `packages/execution-engine`: typed action dispatch and rollback
-- `packages/verification-engine`: post-action verification
-- `packages/audit`: append-only local audit log
-- `packages/agent-runtime`: stateful orchestration and session persistence
-- `os-adapters/linux`: workspace `.env` adapter
+- `apps/daemon`: runtime composition root and token-authenticated local API
+- `apps/desktop-shell`: Electron shell that starts and embeds the daemon UI
+- `packages/agent-runtime`: canonical orchestration, session control, goal verification, rollback journal
+- `packages/task-graph-scheduler`: dependency-aware task execution and task state tracking
+- `packages/capability-registry`: one canonical adapter-backed definition per capability, plus the opt-in signed-plugin loader
+- `packages/permission-broker`: deny-by-default capability grants (scope, type, lifetime, reuse) issued per session and consumed at execution
+- `packages/audit`: append-only SHA-256 hash-chained audit log with tamper-evident `verifyChain()`
+- `packages/perception`: sole SemanticState writer, provider normalization, observations, snapshots, and effects
+- `packages/semantic-state`: SQLite graph store queried by planner and recovery
+- `packages/memory`: redacted SQLite working, episodic, failure, and procedural memory
+- `packages/reasoning-engine` and `packages/model-providers`: bounded model boundary with deterministic fallbacks
+- `packages/secrets`: DPAPI-backed secret broker; only references enter plans and history
+- `packages/recovery-engine` and `packages/troubleshooting-engine`: bounded recovery decisions and diagnosis
+- `os-adapters/windows`: Windows system, environment, filesystem, package, and developer-workflow adapters
 
-## Explicit Non-Goals For This Slice
+## Explicit Non-Goals
 
 - unrestricted shell access
-- system-wide environment mutation
-- direct LLM provider integration
-- browser or desktop automation
+- browser, Windows UI, Office, or registry automation
 - autonomous privilege escalation
 - untyped tool execution
-
-## Why This Slice First
-
-Project-local environment mutation is narrow enough to secure and broad enough to prove the architecture:
-
-- it requires intent parsing and context gathering
-- it mutates persistent state
-- it needs approvals, checkpointing, verification, and rollback
-- it creates reusable patterns for future filesystem, service, and package capabilities

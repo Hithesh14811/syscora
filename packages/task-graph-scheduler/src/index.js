@@ -14,7 +14,48 @@ const TaskState = {
   SKIPPED: 'SKIPPED',
   CANCELLED: 'CANCELLED',
   ROLLED_BACK: 'ROLLED_BACK',
-  UNCERTAIN: 'UNCERTAIN'
+  UNCERTAIN: 'UNCERTAIN',
+  TIMED_OUT: 'TIMED_OUT'
+}
+
+// Default hard ceiling for a single capability phase (execute/observe/verify)
+// when the capability declares no timeout. This is a backstop against a hung
+// capability, distinct from the capability's own cooperative timeout.
+const DEFAULT_HARD_TIMEOUT_MS = 120000
+
+// Race an async phase against a hard wall-clock deadline. On timeout the
+// returned promise rejects with a TimeoutError and the AbortController is
+// aborted so a cooperative capability can stop promptly; a non-cooperative
+// capability is abandoned (its result is ignored) so the scheduler is never
+// blocked by a hung capability.
+function runWithHardTimeout(phase, timeoutMs, controller) {
+  const limit = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : DEFAULT_HARD_TIMEOUT_MS
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const timer = setTimeout(() => {
+      if (settled) return
+      settled = true
+      try { controller?.abort() } catch { /* abort is best-effort */ }
+      const error = new Error(`Capability phase exceeded hard timeout of ${limit}ms`)
+      error.name = 'TimeoutError'
+      error.timedOut = true
+      reject(error)
+    }, limit)
+    Promise.resolve()
+      .then(() => phase(controller?.signal))
+      .then((value) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        resolve(value)
+      })
+      .catch((error) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        reject(error)
+      })
+  })
 }
 
 class TaskGraphScheduler {
@@ -133,56 +174,89 @@ class TaskGraphScheduler {
       backoffMs: Number(capability.retryPolicy?.backoffMs ?? 0)
     }
 
+    // Hard execution timeout: a capability that hangs must not block the whole
+    // scheduler. Each execution attempt is raced against a wall-clock deadline
+    // derived from the capability's declared timeout (performance.timeoutMs /
+    // timeout), with a conservative default backstop. On timeout the controller
+    // is aborted (cooperative capabilities that accept a signal stop promptly)
+    // and the phase is abandoned.
+    const hardTimeoutMs = Number(
+      capability.performance?.timeoutMs ?? capability.timeout ?? task.timeoutMs ?? DEFAULT_HARD_TIMEOUT_MS
+    )
+    const controller = new AbortController()
+
     let executionResult
+    let timedOut = false
     try {
+      const runOnce = (signal) => capability.execute(task.inputs, { signal })
       if (this.recoveryEngine) {
         const recoveryResult = await this.recoveryEngine.executeWithBudget(
           { action: { retryPolicy } },
-          async () => await capability.execute(task.inputs)
+          async () => runWithHardTimeout(runOnce, hardTimeoutMs, new AbortController())
         )
         if (!recoveryResult.success) {
-          const err = recoveryResult.errors?.at(-1)?.message ?? 'Execution failed after retries'
+          const lastError = recoveryResult.errors?.at(-1)
+          const err = lastError?.message ?? 'Execution failed after retries'
+          if (lastError?.timedOut || /hard timeout/i.test(err)) timedOut = true
           throw new Error(err)
         }
         executionResult = recoveryResult.output
         this.taskResults.set(task.taskId, executionResult)
       } else {
-        executionResult = await capability.execute(task.inputs)
+        executionResult = await runWithHardTimeout(runOnce, hardTimeoutMs, controller)
         this.taskResults.set(task.taskId, executionResult)
       }
     } catch (error) {
-      this.taskResults.set(task.taskId, { error: error.message })
-      this._setTaskState(task.taskId, TaskState.FAILED)
+      if (error?.timedOut || error?.name === 'TimeoutError' || /hard timeout/i.test(error?.message ?? '')) {
+        timedOut = true
+      }
+      this.taskResults.set(task.taskId, { error: error.message, timedOut })
+      // A hung capability is recorded as TIMED_OUT (a distinct terminal state)
+      // so the runtime can trigger recovery and the audit trail can distinguish
+      // it from a normal failure; getFinalStatus folds it into FAILED.
+      this._setTaskState(task.taskId, timedOut ? TaskState.TIMED_OUT : TaskState.FAILED)
       // Surface a structured verification instead of throwing so the runtime's
       // diagnose -> recover -> replan loop can react to it uniformly.
       const verification = {
         status: 'FAILED',
-        message: `Execution error: ${error.message}`,
-        evidence: { error: error.message },
+        message: timedOut ? `Execution timed out: ${error.message}` : `Execution error: ${error.message}`,
+        evidence: { error: error.message, timedOut },
+        category: timedOut ? 'TIMEOUT' : undefined,
         confidence: 1
       }
       this.verifications.set(task.taskId, verification)
-      const observation = this._enrichObservation({ error: error.message }, task, 'execution-error')
+      const observation = this._enrichObservation({ error: error.message, timedOut }, task, timedOut ? 'execution-timeout' : 'execution-error')
       this.observations.set(task.taskId, observation)
-      return { verification, observation, executionResult: { error: error.message } }
+      return { verification, observation, executionResult: { error: error.message, timedOut } }
     }
 
     this._setTaskState(task.taskId, TaskState.OBSERVING)
 
+    // Observation is bounded exactly like execution: a hung observe() must not
+    // block the scheduler. It runs against a fresh hard-timeout deadline with a
+    // cooperative abort signal; on timeout the phase is abandoned and the task
+    // fails with a TIMEOUT category so recovery can react.
     let observation
     try {
-      observation = await capability.observe(executionResult, task.inputs)
+      const observeController = new AbortController()
+      observation = await runWithHardTimeout(
+        (signal) => capability.observe(executionResult, task.inputs, { signal }),
+        hardTimeoutMs,
+        observeController
+      )
     } catch (error) {
-      const obs = this._enrichObservation({ error: error.message }, task, 'observe-error')
+      const observeTimedOut = error?.timedOut || error?.name === 'TimeoutError' || /hard timeout/i.test(error?.message ?? '')
+      const obs = this._enrichObservation({ error: error.message, timedOut: observeTimedOut }, task, observeTimedOut ? 'observe-timeout' : 'observe-error')
       this.observations.set(task.taskId, obs)
       const verification = {
         status: 'FAILED',
-        message: `Observation error: ${error.message}`,
-        evidence: { error: error.message },
+        message: observeTimedOut ? `Observation timed out: ${error.message}` : `Observation error: ${error.message}`,
+        evidence: { error: error.message, timedOut: observeTimedOut },
+        category: observeTimedOut ? 'TIMEOUT' : undefined,
         confidence: 1
       }
       this.verifications.set(task.taskId, verification)
-      this._setTaskState(task.taskId, TaskState.FAILED)
+      this._setTaskState(task.taskId, observeTimedOut ? TaskState.TIMED_OUT : TaskState.FAILED)
       return { verification, observation: obs, executionResult }
     }
 
@@ -190,10 +264,32 @@ class TaskGraphScheduler {
     this.observations.set(task.taskId, observation)
     this._setTaskState(task.taskId, TaskState.VERIFYING)
 
+    // Verification is bounded too. A hung verify() previously threw only on
+    // error, never on hang; now it is raced against the hard deadline. On
+    // timeout the task is UNCERTAIN (the outcome could not be confirmed) with a
+    // structured verification so the runtime can diagnose/recover uniformly.
     let verification
     try {
-      verification = await capability.verify(observation, task.inputs)
+      const verifyController = new AbortController()
+      verification = await runWithHardTimeout(
+        (signal) => capability.verify(observation, task.inputs, { signal }),
+        hardTimeoutMs,
+        verifyController
+      )
     } catch (error) {
+      const verifyTimedOut = error?.timedOut || error?.name === 'TimeoutError' || /hard timeout/i.test(error?.message ?? '')
+      if (verifyTimedOut) {
+        const verification = {
+          status: 'INCONCLUSIVE',
+          message: `Verification timed out: ${error.message}`,
+          evidence: { error: error.message, timedOut: true },
+          category: 'TIMEOUT',
+          confidence: 0.5
+        }
+        this.verifications.set(task.taskId, verification)
+        this._setTaskState(task.taskId, TaskState.UNCERTAIN)
+        return { verification, observation, executionResult }
+      }
       this.verifications.set(task.taskId, { error: error.message })
       this._setTaskState(task.taskId, TaskState.UNCERTAIN)
       throw error
@@ -228,6 +324,17 @@ class TaskGraphScheduler {
     return this.taskStates.get(taskId)
   }
 
+  // Reconciled current verification per task (taskId -> verification), reflecting
+  // state AFTER any replan/re-run — a superseded FAILED verification is replaced
+  // by the task's latest outcome. This is the authoritative per-task signal for
+  // goal verification, distinct from the runtime's accumulating history.
+  getReconciledVerifications() {
+    return Array.from(this.verifications.entries()).map(([taskId, verification]) => ({
+      taskId,
+      ...(verification && typeof verification === 'object' ? verification : { value: verification })
+    }))
+  }
+
   getFinalStatus() {
     if (!this.isComplete()) return null
 
@@ -235,7 +342,9 @@ class TaskGraphScheduler {
       state => state === TaskState.VERIFIED || state === TaskState.SKIPPED
     )
 
-    const anyFailed = Array.from(this.taskStates.values()).some(state => state === TaskState.FAILED)
+    const anyFailed = Array.from(this.taskStates.values()).some(
+      state => state === TaskState.FAILED || state === TaskState.TIMED_OUT
+    )
     const anyUncertain = Array.from(this.taskStates.values()).some(state => state === TaskState.UNCERTAIN)
 
     if (allVerified) {

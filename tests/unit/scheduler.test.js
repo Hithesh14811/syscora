@@ -40,4 +40,106 @@ describe('TaskGraphScheduler', () => {
     assert.strictEqual(readyTasks.length, 1)
     assert.strictEqual(readyTasks[0].taskId, task1Id)
   })
+
+  it('enforces a hard timeout on a hung capability instead of blocking forever', async () => {
+    // A capability whose execute() never resolves must not hang the scheduler.
+    const registry = new CapabilityRegistry([
+      {
+        name: 'test.hang',
+        version: '1.0.0',
+        description: 'Never resolves',
+        inputSchema: { type: 'object' },
+        outputSchema: { type: 'object' },
+        riskMetadata: { level: 'LOW' },
+        reversibility: 'NOT_REQUIRED',
+        preconditions: () => true,
+        // Ignores the abort signal, so only the hard timeout can stop it.
+        execute: () => new Promise(() => {}),
+        observe: async (result) => ({ structuredState: result }),
+        verify: async () => ({ status: 'VERIFIED' }),
+        // Small declared timeout drives the hard deadline.
+        timeout: 200,
+        lifecycleStatus: 'VERIFIED'
+      }
+    ])
+    const scheduler = new TaskGraphScheduler({ capabilityRegistry: registry })
+    const taskId = createId()
+    scheduler.initialize({ tasks: [{ taskId, capability: 'test.hang', dependencies: [], inputs: {} }] })
+
+    const started = Date.now()
+    const { verification, executionResult } = await scheduler.executeTask({ taskId, capability: 'test.hang', dependencies: [], inputs: {} })
+    const elapsed = Date.now() - started
+
+    assert.strictEqual(verification.status, 'FAILED')
+    assert.strictEqual(executionResult.timedOut, true)
+    assert.strictEqual(scheduler.getTaskState(taskId), TaskState.TIMED_OUT)
+    assert.ok(elapsed < 5000, `hard timeout should fire promptly (took ${elapsed}ms)`)
+    // A hung task folds into a terminal FAILED final status, never left pending.
+    assert.strictEqual(scheduler.isComplete(), true)
+    assert.strictEqual(scheduler.getFinalStatus().status, 'FAILED')
+  })
+
+  it('bounds a hung observe() phase with the hard timeout', async () => {
+    const registry = new CapabilityRegistry([
+      {
+        name: 'test.hang.observe',
+        version: '1.0.0',
+        description: 'observe never resolves',
+        inputSchema: { type: 'object' },
+        outputSchema: { type: 'object' },
+        riskMetadata: { level: 'LOW' },
+        reversibility: 'NOT_REQUIRED',
+        preconditions: () => true,
+        execute: async () => ({ ok: true }),
+        observe: () => new Promise(() => {}),
+        verify: async () => ({ status: 'VERIFIED' }),
+        timeout: 200,
+        lifecycleStatus: 'VERIFIED'
+      }
+    ])
+    const scheduler = new TaskGraphScheduler({ capabilityRegistry: registry })
+    const taskId = createId()
+    scheduler.initialize({ tasks: [{ taskId, capability: 'test.hang.observe', dependencies: [], inputs: {} }] })
+
+    const started = Date.now()
+    const { verification } = await scheduler.executeTask({ taskId, capability: 'test.hang.observe', dependencies: [], inputs: {} })
+    const elapsed = Date.now() - started
+
+    assert.strictEqual(verification.status, 'FAILED')
+    assert.strictEqual(verification.category, 'TIMEOUT')
+    assert.strictEqual(scheduler.getTaskState(taskId), TaskState.TIMED_OUT)
+    assert.ok(elapsed < 5000, `observe hard timeout should fire promptly (took ${elapsed}ms)`)
+  })
+
+  it('bounds a hung verify() phase with the hard timeout (UNCERTAIN, not blocked)', async () => {
+    const registry = new CapabilityRegistry([
+      {
+        name: 'test.hang.verify',
+        version: '1.0.0',
+        description: 'verify never resolves',
+        inputSchema: { type: 'object' },
+        outputSchema: { type: 'object' },
+        riskMetadata: { level: 'LOW' },
+        reversibility: 'NOT_REQUIRED',
+        preconditions: () => true,
+        execute: async () => ({ ok: true }),
+        observe: async (result) => ({ structuredState: result }),
+        verify: () => new Promise(() => {}),
+        timeout: 200,
+        lifecycleStatus: 'VERIFIED'
+      }
+    ])
+    const scheduler = new TaskGraphScheduler({ capabilityRegistry: registry })
+    const taskId = createId()
+    scheduler.initialize({ tasks: [{ taskId, capability: 'test.hang.verify', dependencies: [], inputs: {} }] })
+
+    const started = Date.now()
+    const { verification } = await scheduler.executeTask({ taskId, capability: 'test.hang.verify', dependencies: [], inputs: {} })
+    const elapsed = Date.now() - started
+
+    assert.strictEqual(verification.status, 'INCONCLUSIVE')
+    assert.strictEqual(verification.category, 'TIMEOUT')
+    assert.strictEqual(scheduler.getTaskState(taskId), TaskState.UNCERTAIN)
+    assert.ok(elapsed < 5000, `verify hard timeout should fire promptly (took ${elapsed}ms)`)
+  })
 })

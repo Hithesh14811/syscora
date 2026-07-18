@@ -215,6 +215,44 @@ test("recordActionEffect persists a diff-based effect and emits event", async ()
   const delta = await engine.recordActionEffect("task-1", before, after);
   assert.ok(delta.addedEntities.length >= 1);
   assert.ok(events.some((e) => e.type === PerceptionEvent.ACTION_EFFECT_RECORDED));
+  // The effect must ACTUALLY persist. Previously recordActionEffects called
+  // createSnapshot without the writer token, so the single-writer guard threw
+  // and the effect was silently swallowed — the event fired but nothing landed.
+  const persisted = await semanticState.getSnapshot("action_task-1");
+  assert.ok(persisted, "action effect snapshot is durably persisted");
+  assert.ok(persisted.entityIds.length >= 1, "persisted snapshot carries the effect entity ids");
+  assert.ok(!events.some((e) => e.type === PerceptionEvent.ACTION_EFFECT_FAILED), "no persistence failure");
+  await semanticState.close();
+});
+
+test("recordEffects persists explicit ids through the writer token (no silent failure)", async () => {
+  const { engine, semanticState, events } = await buildEngine();
+  // Claim a writer to prove the token propagates; without it the single-writer
+  // guard used to reject the write and perception swallowed the error.
+  await engine.recordEffects("explicit-task", ["ent-a", "ent-b"], ["rel-a"]);
+  const persisted = await semanticState.getSnapshot("action_explicit-task");
+  assert.ok(persisted, "explicit action effect is durably persisted");
+  assert.deepEqual(persisted.entityIds.sort(), ["ent-a", "ent-b"]);
+  assert.deepEqual(persisted.relationshipIds, ["rel-a"]);
+  assert.ok(events.some((e) => e.type === PerceptionEvent.ACTION_EFFECT_RECORDED));
+  assert.ok(!events.some((e) => e.type === PerceptionEvent.ACTION_EFFECT_FAILED));
+  await semanticState.close();
+});
+
+test("action-effect persistence failure is surfaced, never silently dropped", async () => {
+  const { engine, semanticState, events } = await buildEngine();
+  // Force the underlying persistence to fail and prove the failure is observable
+  // (ACTION_EFFECT_FAILED event + thrown error), not swallowed.
+  semanticState.recordActionEffects = async () => { throw new Error("disk full"); };
+  await assert.rejects(
+    () => engine.recordEffects("boom-task", ["ent-x"], []),
+    /disk full/,
+    "persistence failure propagates to the caller"
+  );
+  assert.ok(
+    events.some((e) => e.type === PerceptionEvent.ACTION_EFFECT_FAILED),
+    "an ACTION_EFFECT_FAILED event is emitted"
+  );
   await semanticState.close();
 });
 

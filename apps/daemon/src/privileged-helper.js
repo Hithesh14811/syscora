@@ -41,7 +41,10 @@ async function main() {
 
   const result = await helper.execute(args.operation, args.scope, {
     token: args.token,
-    sessionId
+    sessionId,
+    // Mode defaults to the safe read-only VALIDATE inside the helper; COMMIT
+    // must be requested explicitly so an approved token alone never mutates.
+    mode: args.mode
   });
 
   await auditRepository.append(sessionId, result.success ? "PRIVILEGED_HELPER_EXECUTED" : "PRIVILEGED_HELPER_FAILED", {

@@ -2,9 +2,8 @@ import http from "node:http";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { createRuntime } from "./runtime-factory.js";
+import { createRuntime, loadCapabilityPlugins } from "./runtime-factory.js";
 import { ValidationError } from "../../../packages/shared-types/src/domain.js";
 import { buildEnvelope, parseRequestBodyWithEnvelope } from "../../../packages/protocol/src/envelope.js";
 import { buildSessionResponse } from "../../../packages/protocol/src/session-protocol.js";
@@ -18,9 +17,19 @@ function sendJson(response, statusCode, payload) {
   response.end(JSON.stringify(payload, null, 2));
 }
 
+// Cap request bodies so a large or endless POST cannot exhaust daemon memory.
+const MAX_REQUEST_BODY_BYTES = 1024 * 1024; // 1 MiB is ample for intents.
+
 async function readJsonBody(request) {
   const chunks = [];
+  let total = 0;
   for await (const chunk of request) {
+    total += chunk.length;
+    if (total > MAX_REQUEST_BODY_BYTES) {
+      const error = new Error("Request body exceeds maximum allowed size.");
+      error.statusCode = 413;
+      throw error;
+    }
     chunks.push(chunk);
   }
   const raw = Buffer.concat(chunks).toString("utf8");
@@ -42,40 +51,30 @@ function inferContentType(filePath) {
   return "application/octet-stream";
 }
 
-async function runPrivilegedHelper({ basePath, sessionId, operation, scope, token }) {
-  return new Promise((resolve) => {
-    const child = spawn(process.execPath, [
-      path.resolve(__dirname, "./privileged-helper.js"),
-      "--basePath", basePath,
-      "--sessionId", sessionId,
-      "--operation", operation,
-      "--scope", scope,
-      "--token", token
-    ], {
-      stdio: ["ignore", "pipe", "pipe"],
-      shell: false
-    });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
-    child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
-    child.on("close", (code) => {
-      resolve({
-        exitCode: code ?? -1,
-        stdout,
-        stderr
-      });
-    });
-  });
-}
 
 export function startServer({ port = 4317, basePath = process.cwd() } = {}) {
   const runtime = createRuntime(basePath);
+  // Opt-in signed capability plugins (SYSCORA_PLUGIN_DIR + trusted keys). Loading
+  // is best-effort at startup and never blocks the server; a failure to load a
+  // plugin leaves the built-in capabilities intact.
+  loadCapabilityPlugins(runtime)
+    .then((result) => {
+      if (!result.skipped) console.log(`SYSCORA loaded ${result.loaded.length} capability plugin(s).`);
+      else if (process.env.SYSCORA_PLUGIN_DIR) console.log(`SYSCORA plugin loading skipped: ${result.reason}`);
+    })
+    .catch((error) => console.error(`SYSCORA plugin loading failed: ${error.message}`));
   const apiToken = process.env.SYSCORA_API_TOKEN ?? crypto.randomBytes(24).toString("hex");
 
+  const apiTokenBuffer = Buffer.from(apiToken, "utf8");
   function isAuthorized(request) {
     const token = request.headers["x-syscora-token"];
-    return typeof token === "string" && token === apiToken;
+    if (typeof token !== "string") return false;
+    // Constant-time comparison to avoid leaking the token via response timing.
+    // Length must match first because timingSafeEqual requires equal-length
+    // buffers; the length of a random 24-byte hex token is not secret.
+    const provided = Buffer.from(token, "utf8");
+    if (provided.length !== apiTokenBuffer.length) return false;
+    return crypto.timingSafeEqual(provided, apiTokenBuffer);
   }
 
   const server = http.createServer(async (request, response) => {
@@ -427,6 +426,12 @@ export function startServer({ port = 4317, basePath = process.cwd() } = {}) {
       }
 
       if (request.method === "POST" && requestUrl.pathname === "/api/privileged/execute") {
+        // Transport adapter only: validate + authenticate (done above), then
+        // construct an intent and delegate to the canonical runtime. All
+        // planning, policy, permissions, scheduling, privileged execution,
+        // observation, verification, rollback, semantic/memory updates, and
+        // auditing happen inside submitIntent — this handler contains no
+        // business logic and never invokes the privileged helper directly.
         const body = await readJsonBody(request);
         const parsed = parseRequestBodyWithEnvelope(body, "privileged_execute_request");
         const payload = parsed.payload;
@@ -434,25 +439,34 @@ export function startServer({ port = 4317, basePath = process.cwd() } = {}) {
           sendJson(response, 400, { error: "operation, scope, and token are required." });
           return;
         }
-        const execution = await runPrivilegedHelper({
-          basePath,
-          sessionId: payload.sessionId ?? "privileged",
-          operation: payload.operation,
-          scope: payload.scope,
-          token: payload.token
-        });
-        let parsedStdout;
-        try {
-          parsedStdout = execution.stdout ? JSON.parse(execution.stdout) : null;
-        } catch {
-          parsedStdout = null;
-        }
+        const mode = payload.mode === "COMMIT" ? "COMMIT" : "VALIDATE";
+        const privilegedSessionId = payload.sessionId ?? "privileged";
+        // The explicit approval already happened in POST /api/privileged/approve
+        // (the single-use token is proof of it), so the policy CONFIRM gate is
+        // satisfied here. The mandatory, single-use, operation+scope-bound token
+        // — consumed inside the privileged capability — remains the authoritative
+        // enforcement: without it the capability refuses to mutate regardless of
+        // the policy decision.
+        const session = await runtime.submitIntent(
+          `Privileged operation ${payload.operation} on ${payload.scope}`,
+          {
+            workspacePath: basePath,
+            operation: payload.operation,
+            category: "SYSTEM",
+            normalizedGoal: `Privileged ${payload.operation}`,
+            entities: {
+              scope: payload.scope,
+              token: payload.token,
+              mode,
+              sessionId: privilegedSessionId
+            },
+            autoApprove: true
+          }
+        );
+        const legacy = buildSessionResponse(session);
         sendJson(response, 200, {
-          envelope: buildEnvelope("privileged_execute_response", {
-            ...execution,
-            result: parsedStdout
-          }, parsed.requestId),
-          execution
+          envelope: buildEnvelope("privileged_execute_response", legacy, parsed.requestId),
+          ...legacy
         });
         return;
       }
@@ -481,6 +495,14 @@ export function startServer({ port = 4317, basePath = process.cwd() } = {}) {
           error: "Protocol validation error",
           message: error.message
         });
+        return;
+      }
+      if (error?.statusCode === 413) {
+        sendJson(response, 413, { error: "Payload too large", message: error.message });
+        return;
+      }
+      if (error?.code === "ENOENT") {
+        sendJson(response, 404, { error: "Not found" });
         return;
       }
       sendJson(response, 500, {

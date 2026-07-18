@@ -183,3 +183,39 @@ test("SemanticState - createSnapshot and getRelevantState", async () => {
 
   await semanticState.close();
 });
+
+test("SemanticState - single-writer guard rejects unauthorized writes once claimed", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "syscora-writer-"));
+  const semanticState = new SemanticState(tempDir);
+
+  // Before any writer claims ownership, direct writes are allowed (test/direct
+  // construction convenience).
+  await semanticState.upsertEntity({
+    id: crypto.randomUUID(), type: "File", canonicalKey: "/a.txt",
+    properties: {}, confidence: 1, firstSeenAt: new Date().toISOString(),
+    lastSeenAt: new Date().toISOString(), provenance: "test"
+  });
+
+  // Once a controlled writer claims ownership, unauthorized writes must throw.
+  const token = semanticState.authorizeWriter();
+  await assert.rejects(
+    () => semanticState.upsertEntity({
+      id: crypto.randomUUID(), type: "File", canonicalKey: "/b.txt",
+      properties: {}, confidence: 1, firstSeenAt: new Date().toISOString(),
+      lastSeenAt: new Date().toISOString(), provenance: "test"
+    }),
+    /controlled write/
+  );
+
+  // The authorized writer (holding the token) may still write.
+  await semanticState.upsertEntity({
+    id: crypto.randomUUID(), type: "File", canonicalKey: "/c.txt",
+    properties: {}, confidence: 1, firstSeenAt: new Date().toISOString(),
+    lastSeenAt: new Date().toISOString(), provenance: "test"
+  }, token);
+
+  const entities = await semanticState.queryEntities({ type: "File" });
+  assert.equal(entities.length, 2);
+
+  await semanticState.close();
+});

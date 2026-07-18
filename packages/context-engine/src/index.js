@@ -140,7 +140,9 @@ export class WorkspaceContextProvider extends ContextProvider {
 
   async collect(request) {
     const workspacePath = request.workspacePath ?? process.cwd();
-    const inspection = this.developerIntelligence?.inspectProject?.(workspacePath);
+    const inspection = this.developerIntelligence
+      ? await this.developerIntelligence.inspectProject(workspacePath)
+      : null;
     return {
       contextId: createId(),
       type: "workspace",
@@ -173,5 +175,42 @@ export class ContextEngine {
       }
     }
     return contextItems;
+  }
+
+  // Create the bounded, deduplicated context handed to reasoning. Ranking is
+  // deterministic so equivalent runtime state always yields equivalent input.
+  buildPlanningContext({
+    intent = {}, baseContext = [], semanticSubgraph = {}, memory = [],
+    capabilityRegistry = null, policyConstraints = [], recoveryBudget = null,
+    tokenBudget = 12000
+  } = {}) {
+    const limit = Math.max(1000, Number(tokenBudget) || 12000);
+    const items = [];
+    const push = (kind, value, rank) => {
+      const serialized = JSON.stringify(value);
+      if (!serialized || serialized === "{}" || serialized === "[]") return;
+      items.push({ kind, value, rank, key: `${kind}:${serialized}`, cost: Math.ceil(serialized.length / 4) });
+    };
+    for (const item of baseContext) push(`context:${item.type}`, item.data, 100);
+    for (const entity of semanticSubgraph.entities ?? []) push("entity", entity, 80 + Number(entity.confidence ?? 0));
+    for (const relationship of semanticSubgraph.relationships ?? []) push("relationship", relationship, 60);
+    for (const record of memory) {
+      const rank = record.type === "PROCEDURAL" ? 70 : record.type === "FAILURE_PATTERN" ? 65 : 50;
+      push(`memory:${record.type}`, record, rank + Number(record.relevanceScore ?? 0) / 1000);
+    }
+    if (capabilityRegistry) push("capabilities", capabilityRegistry.getCatalog(), 90);
+    push("policy", policyConstraints, 95);
+    push("recovery", recoveryBudget, 95);
+    items.sort((left, right) => right.rank - left.rank || left.key.localeCompare(right.key));
+    const seen = new Set();
+    let usedTokens = 0;
+    const selected = [];
+    for (const item of items) {
+      if (seen.has(item.key) || usedTokens + item.cost > limit) continue;
+      seen.add(item.key);
+      usedTokens += item.cost;
+      selected.push({ kind: item.kind, value: item.value });
+    }
+    return { intent, items: selected, tokenBudget: limit, estimatedTokens: usedTokens };
   }
 }
